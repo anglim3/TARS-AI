@@ -1,0 +1,10 @@
+name: household
+version: 0.1.0
+description: Home Assistant, Google Calendar, and Todoist for the TARS voice agent.
+provides_tools:
+  - home
+  - calendar_agenda
+  - calendar_create
+  - tasks_list
+  - tasks_add
+  - tasks_complete
