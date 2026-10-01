@@ -49,6 +49,90 @@ except ImportError:
 # Set by module_main.py before calling process_completion(); cleared afterward.
 _reply_chunk_callback = None
 
+
+def _emit_reply_text(text):
+    callback = _reply_chunk_callback
+    if callback is None or not text:
+        return
+    try:
+        callback(text, True)
+    except Exception:
+        pass
+
+
+def _hermes_voice_turn(user_text):
+    """POST the heard line to loopback Hermes and return one spoken sentence.
+
+    Hermes already ran its tools. This path does not send the JSON schema
+    and does not dispatch function_calls. json_mode is off: the body has
+    no response_format.
+    """
+    from modules.module_tts import request_outage_voice
+    from modules.module_xai import (
+        HERMES_FAILURE_LINE,
+        assistant_text_from_response,
+        hermes_api_key,
+        hermes_health_url,
+        hermes_request_body,
+        hermes_responses_url,
+    )
+
+    base_url = CONFIG['LLM'].get('base_url') or "http://127.0.0.1:8642/v1"
+    key = hermes_api_key() or CONFIG['LLM'].get('api_key') or ""
+    failure = {
+        "reply": HERMES_FAILURE_LINE,
+        "function_calls": [],
+        "new_memories": [],
+    }
+
+    def _fail(reason):
+        queue_message(f"ERROR: Hermes unavailable: {reason}")
+        request_outage_voice(True)
+        _emit_reply_text(HERMES_FAILURE_LINE)
+        return failure
+
+    if not key:
+        return _fail("HERMES_API_KEY is not set")
+
+    try:
+        health = _http_session.get(hermes_health_url(base_url), timeout=2)
+        if health.status_code >= 500:
+            return _fail(f"health {health.status_code}")
+    except requests.RequestException as exc:
+        return _fail(str(exc))
+
+    body = hermes_request_body(user_text)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {key}",
+    }
+    try:
+        response = _http_session.post(
+            hermes_responses_url(base_url),
+            headers=headers,
+            json=body,
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        return _fail(str(exc))
+    except ValueError as exc:
+        return _fail(f"bad JSON: {exc}")
+
+    sentence = assistant_text_from_response(payload)
+    if not sentence:
+        return _fail("empty assistant text")
+
+    request_outage_voice(False)
+    _emit_reply_text(sentence)
+    return {
+        "reply": sentence,
+        "function_calls": [],
+        "new_memories": [],
+    }
+
+
 # Speaker ID start timestamp — set by module_main.py so the deferred wait
 # in build_prompt can block for the remaining budget before resolving the name.
 _sid_start_time = None
@@ -172,6 +256,12 @@ def _maybe_play_thinking_response():
 
 def get_completion(user_prompt, istext=True, image_b64=None, source="voice"):
 
+    if CONFIG['LLM'].get('llm_backend') == 'hermes':
+        parsed = _hermes_voice_turn(user_prompt)
+        if not parsed:
+            return None
+        return _sanitize_for_tts(parsed.get("reply", ""))
+
     if memory_manager is None or character_manager is None:
         raise ValueError("MemoryManager and CharacterManager must be initialized before generating completions.")
 
@@ -294,6 +384,9 @@ def process_completion(prompt, image_b64=None):
     or a plain string on error.
     """
     def _get_parsed(prompt):
+        if CONFIG['LLM'].get('llm_backend') == 'hermes':
+            return _hermes_voice_turn(prompt)
+
         if memory_manager is None or character_manager is None:
             raise ValueError("Managers must be initialized")
 

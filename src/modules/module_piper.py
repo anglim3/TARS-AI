@@ -73,19 +73,28 @@ def _is_lfs_pointer(filepath):
         return False
 
 voice = None
-if CONFIG['TTS']['ttsoption'] == 'piper':
-    # Auto-download from Hugging Face if missing or is a Git LFS pointer
+_voice_load_attempted = False
+
+
+def _ensure_voice():
+    """Load the Piper model on first use.
+
+    The primary voice can be xAI. Piper still has to load later, because
+    it is the outage voice when xAI or Hermes is down.
+    """
+    global voice, _voice_load_attempted
+    if voice is not None or _voice_load_attempted:
+        return voice
+    _voice_load_attempted = True
+
     if not os.path.isfile(model_path) or _is_lfs_pointer(model_path):
         queue_message(f"[Piper] Voice model missing or incomplete, attempting download from Hugging Face...")
         if not _download_voice_model(character_name, model_path):
             queue_message("[Piper] Auto-download failed. Please manually place a valid .onnx voice model in the character voice folder.")
 
-    # Load the model if it now exists
     if os.path.isfile(model_path) and not _is_lfs_pointer(model_path):
         try:
             voice = PiperVoice.load(model_path)
-            # Warmup: run a dummy synthesis to trigger ONNX runtime JIT
-            # so the first real call doesn't pay the compilation cost.
             _warmup_buf = BytesIO()
             with wave.open(_warmup_buf, 'wb') as _wf:
                 _wf.setnchannels(1)
@@ -101,6 +110,11 @@ if CONFIG['TTS']['ttsoption'] == 'piper':
             queue_message(f"[Piper] The file may be corrupt: {model_path}")
             queue_message("[Piper] Try re-downloading the .onnx voice model.")
             voice = None
+    return voice
+
+
+if CONFIG['TTS']['ttsoption'] == 'piper':
+    _ensure_voice()
 
 def _get_piper_speaker_id(emotion):
     """Return speaker ID for the given emotion axis, or None if multispeaker is disabled."""
@@ -154,7 +168,8 @@ async def text_to_speech_with_pipelining_piper(text, emotion=None):
     Converts text to speech using the Piper model and streams audio as it's generated.
     When piper_multispeaker is enabled, selects speaker based on detected emotion.
     """
-    if voice is None:
+    active = _ensure_voice()
+    if active is None:
         queue_message("[Piper] Cannot synthesize - voice model not loaded. Check logs for details.")
         return
 
@@ -175,5 +190,5 @@ async def text_to_speech_with_pipelining_piper(text, emotion=None):
     # Yield each audio chunk as soon as it's ready
     for chunk in chunks:
         if chunk.strip():  # Ignore empty chunks
-            wav_buffer = await synthesize(voice, chunk.strip(), speaker_id=speaker_id)
+            wav_buffer = await synthesize(active, chunk.strip(), speaker_id=speaker_id)
             yield wav_buffer  # Return the chunk for external playback

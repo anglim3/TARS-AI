@@ -2275,6 +2275,7 @@ function executeAction() {
     'openai':    'https://api.openai.com/',
     'grok':      'https://api.x.ai/',
     'deepinfra': 'https://api.deepinfra.com/v1/openai',
+    'hermes':    'http://127.0.0.1:8642/v1',
   };
 
   function attachBackendUrlAutoFill() {

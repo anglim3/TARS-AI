@@ -58,8 +58,8 @@ class DeviceCapabilities:
 DEVICE_PROFILES: Dict[DeviceProfile, DeviceCapabilities] = {
     DeviceProfile.PI5: DeviceCapabilities(
         profile=DeviceProfile.PI5,
-        allowed_stt={"fastrtc", "silero", "openai", "external", "sherpa-onnx"},
-        allowed_tts={"espeak", "piper", "silero", "elevenlabs", "openai", "other", "external"},
+        allowed_stt={"fastrtc", "silero", "openai", "external", "sherpa-onnx", "xai"},
+        allowed_tts={"espeak", "piper", "silero", "elevenlabs", "openai", "other", "external", "xai"},
         allowed_vad={"silero", "rms", "sherpa-onnx", "smart-turn"},
         allowed_wake={"fastrtc", "atomik", "sherpa-onnx"},
         can_use_embeddings=True,
@@ -76,8 +76,8 @@ DEVICE_PROFILES: Dict[DeviceProfile, DeviceCapabilities] = {
     ),
     DeviceProfile.PI4: DeviceCapabilities(
         profile=DeviceProfile.PI4,
-        allowed_stt={"openai", "external", "sherpa-onnx"},
-        allowed_tts={"espeak", "piper", "elevenlabs", "openai", "other", "external"},
+        allowed_stt={"openai", "external", "sherpa-onnx", "xai"},
+        allowed_tts={"espeak", "piper", "elevenlabs", "openai", "other", "external", "xai"},
         allowed_vad={"silero", "rms", "sherpa-onnx", "smart-turn"},
         allowed_wake={"atomik", "sherpa-onnx"},
         can_use_embeddings=True,
@@ -94,8 +94,8 @@ DEVICE_PROFILES: Dict[DeviceProfile, DeviceCapabilities] = {
     ),
     DeviceProfile.PI3: DeviceCapabilities(
         profile=DeviceProfile.PI3,
-        allowed_stt={"openai", "external"},
-        allowed_tts={"espeak", "elevenlabs", "openai", "other", "external"},
+        allowed_stt={"openai", "external", "xai"},
+        allowed_tts={"espeak", "elevenlabs", "openai", "other", "external", "xai"},
         allowed_vad={"rms", "sherpa-onnx"},
         allowed_wake={"atomik", "sherpa-onnx"},
         can_use_embeddings=False,
@@ -112,8 +112,8 @@ DEVICE_PROFILES: Dict[DeviceProfile, DeviceCapabilities] = {
     ),
     DeviceProfile.PIZERO2: DeviceCapabilities(
         profile=DeviceProfile.PIZERO2,
-        allowed_stt={"openai"},
-        allowed_tts={"elevenlabs", "openai", "other", "external"},
+        allowed_stt={"openai", "xai"},
+        allowed_tts={"elevenlabs", "openai", "other", "external", "xai"},
         allowed_vad={"rms"},
         allowed_wake={"atomik"},
         can_use_embeddings=False,
@@ -573,7 +573,8 @@ def get_api_key(llm_backend: str) -> str:
         "openai": "OPENAI_API_KEY",
         "grok": "GROK_API_KEY",
         "deepinfra": "DEEPINFRA_API_KEY",
-        "other": "OTHER_API_KEY"
+        "other": "OTHER_API_KEY",
+        "hermes": "HERMES_API_KEY",
     }
     if llm_backend not in backend_to_env_var:
         print(f"WARNING: Unsupported LLM backend '{llm_backend}', skipping API key lookup.")
@@ -674,13 +675,13 @@ CONFIG_METADATA = {
         '__description__': 'Configure the AI brain that generates TARS responses',
         'llm_backend': {
             'label': 'AI Backend',
-            'options': ['openai', 'grok', 'deepinfra', 'other'],
-            'description': 'Choose which AI service TARS uses to generate responses. "openai" uses OpenAI (GPT models) — auto-fills the URL, requires OPENAI_API_KEY in .env. "grok" uses xAI\'s Grok — auto-fills the URL, requires XAI_API_KEY in .env. "deepinfra" uses DeepInfra (cheap hosted models) — auto-fills the URL, requires DEEPINFRA_API_KEY in .env. "other" is for any OpenAI-compatible API — you set the URL yourself and it is preserved when switching backends. Use "other" for Featherless.ai, Ollama (local), LM Studio (local), OpenRouter, or any self-hosted model server. Switching backends auto-updates the URL field except for "other", which always restores your saved URL.'
+            'options': ['openai', 'grok', 'deepinfra', 'other', 'hermes'],
+            'description': 'Choose which AI service TARS uses to generate responses. "hermes" posts the heard line to a Hermes agent on loopback (POST /v1/responses) and speaks the final sentence. It requires HERMES_API_KEY and leaves JSON mode off. "openai" uses OpenAI (GPT models) — auto-fills the URL, requires OPENAI_API_KEY in .env. "grok" uses xAI\'s Grok — auto-fills the URL, requires GROK_API_KEY in .env. "deepinfra" uses DeepInfra (cheap hosted models) — auto-fills the URL, requires DEEPINFRA_API_KEY in .env. "other" is for any OpenAI-compatible API — you set the URL yourself and it is preserved when switching backends.'
         },
         'base_url': {
             'label': 'Base URL',
-            'depends_on': [{'field': 'llm_backend', 'values': ['other']}],
-            'description': 'The API endpoint for your AI service. For the "other" backend, set your server address here (e.g. http://192.168.1.100:11434/v1 for Ollama, or https://api.featherless.ai/v1 for Featherless). For "openai", "grok", and "deepinfra" this is handled automatically.'
+            'depends_on': [{'field': 'llm_backend', 'values': ['other', 'hermes']}],
+            'description': 'The API endpoint for your AI service. For "hermes", this is the loopback API root, http://127.0.0.1:8642/v1. For the "other" backend, set your server address here (e.g. http://192.168.1.100:11434/v1 for Ollama, or https://api.featherless.ai/v1 for Featherless). For "openai", "grok", and "deepinfra" this is handled automatically.'
         },
         'openai_model': {
             'label': 'model',
@@ -695,7 +696,7 @@ CONFIG_METADATA = {
         'json_mode': {
             'label': 'JSON Mode',
             'depends_on': [{'field': 'llm_backend', 'values': ['other']}],
-            'description': 'When ON, TARS tells the AI to respond in structured JSON format using the API\'s response_format parameter. Turn OFF if your backend doesn\'t support it (like LM Studio or Ollama) — you\'ll see a 400 Bad Request error if unsupported. TARS will still work without it since the system prompt already asks for JSON, but responses may occasionally need more repair. OpenAI, Grok, and DeepInfra always use JSON mode regardless of this setting.'
+            'description': 'When ON, TARS tells the AI to respond in structured JSON format using the API\'s response_format parameter. Turn OFF if your backend doesn\'t support it (like LM Studio or Ollama). The "hermes" backend always leaves this off and speaks the final sentence. OpenAI, Grok, and DeepInfra always use JSON mode regardless of this setting.'
         },
         'grok_model': {
             'depends_on': [{'field': 'llm_backend', 'values': ['grok']}],
@@ -731,8 +732,8 @@ CONFIG_METADATA = {
         'stt_processor': {
             'group': 'stt', 'group_label': 'Speech Recognition',
             'label': 'STT Engine',
-            'options': ['sherpa-onnx', 'fastrtc', 'openai', 'external', 'silero'],
-            'description': 'How TARS converts your speech to text after the wake word triggers. "sherpa-onnx" is fast and offline (Pi5/Pi4, recommended). "fastrtc" is cloud-based, very accurate. "openai" uses OpenAI Whisper (best for non-English, requires API key). "silero" runs on-device (Pi5 only). "external" forwards audio to your own STT server.'
+            'options': ['sherpa-onnx', 'fastrtc', 'openai', 'external', 'silero', 'xai'],
+            'description': 'How TARS converts your speech to text after the wake word triggers. "xai" streams 16 kHz PCM to xAI and ends the utterance on Smart Turn (requires XAI_API_KEY). "sherpa-onnx" is fast and offline (Pi5/Pi4). "fastrtc" is cloud-based, very accurate. "openai" uses OpenAI Whisper (best for non-English, requires API key). "silero" runs on-device (Pi5 only). "external" forwards audio to your own STT server.'
         },
         'language': {
             'group': 'stt',
@@ -870,8 +871,8 @@ CONFIG_METADATA = {
         },
         'ttsoption': {
             'label': 'TTS Engine',
-            'options': ['espeak', 'piper', 'silero', 'elevenlabs', 'openai', 'other', 'external'],
-            'description': 'Choose how TARS speaks out loud. This is the most important voice setting. FREE options that work without internet: "piper" sounds natural and is the best free option (recommended for Pi 5 and Pi 4). "espeak" is a basic robotic-sounding voice but works on any Pi, even very weak ones. "silero" is another good-sounding option but only works on Pi 5. PAID cloud options (need internet + API key in .env file): "elevenlabs" has the most natural, human-like voices. "openai" is good quality and works well in many languages. "other" lets you point to any external TTS server using a custom URL. "external" sends text to a TARS app-server instance for TTS generation.'
+            'options': ['espeak', 'piper', 'silero', 'elevenlabs', 'openai', 'other', 'external', 'xai'],
+            'description': 'Choose how TARS speaks out loud. "xai" uses the xAI text-to-speech API and the voice id in XAI_TTS_VOICE_ID (requires XAI_API_KEY). Piper stays available as the outage voice when xAI is down. FREE options that work without internet: "piper" sounds natural (Pi 5 and Pi 4). "espeak" is a basic robotic-sounding voice. "silero" is another option on Pi 5. PAID cloud options: "elevenlabs" and "openai". "other" and "external" point at your own TTS server.'
         },
         'ttsurl': {
             'label': 'TTS Server URL',
