@@ -1,0 +1,16 @@
+# desktop autostart stays off
+[Unit]
+Description=TARS Amelia voice loop
+After=graphical-session.target pipewire.service pipewire-pulse.service tars-hermes.service
+Wants=pipewire.service pipewire-pulse.service tars-hermes.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tars/TARS-AI-upstream/src
+Environment=DISPLAY=:0
+ExecStart=/home/tars/TARS-AI-upstream/src/.venv/bin/python app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
