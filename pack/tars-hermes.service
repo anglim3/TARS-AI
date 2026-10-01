@@ -1,0 +1,13 @@
+# desktop autostart stays off
+[Unit]
+Description=TARS Hermes gateway
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env hermes gateway
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
