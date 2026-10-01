@@ -211,15 +211,71 @@ class EdgeDetector(BaseDetector):
         return [{'mask': overlay, 'alpha': alpha}]
 
 
+def _vision_pipeline_enabled():
+    """True only when [VISION] enabled is on.
+
+    Fail closed. UI startup builds every detector, including this one, even
+    when body detection is switched off. OpenCV 5 removed HOGDescriptor from
+    the main package, so a missing config must not touch that symbol.
+    """
+    try:
+        try:
+            from module_config import load_config
+        except ImportError:
+            from modules.module_config import load_config
+        return bool(load_config().get("VISION", {}).get("enabled", False))
+    except Exception:
+        return False
+
+
+def _people_hog():
+    """Pedestrian HOG detector, or None when this OpenCV build has none.
+
+    OpenCV 4 exposes cv2.HOGDescriptor. OpenCV 5 moved it into opencv-contrib
+    (xobjdetect). The Python name stays HOGDescriptor when that module is
+    installed, sometimes under cv2.xobjdetect.
+    """
+    hog_cls = getattr(cv2, "HOGDescriptor", None)
+    people = getattr(cv2, "HOGDescriptor_getDefaultPeopleDetector", None)
+    if hog_cls is None or people is None:
+        xobj = getattr(cv2, "xobjdetect", None)
+        if xobj is not None:
+            if hog_cls is None:
+                hog_cls = getattr(xobj, "HOGDescriptor", None)
+            if people is None:
+                people = getattr(xobj, "HOGDescriptor_getDefaultPeopleDetector", None)
+            if people is None and hog_cls is not None:
+                people = getattr(hog_cls, "getDefaultPeopleDetector", None)
+    if hog_cls is None or not callable(people):
+        return None
+    hog = hog_cls()
+    hog.setSVMDetector(people())
+    return hog
+
+
 class BodyDetector(BaseDetector):
     name = "BODY"
 
     def __init__(self):
         super().__init__()
-        self.hog = cv2.HOGDescriptor()
-        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        self.hog = None
+        # Vision off: do not look up HOGDescriptor at all. OpenCV 5.0 has no
+        # such symbol, and this object is created during UI startup.
+        if not _vision_pipeline_enabled():
+            self.enabled = False
+            return
+        try:
+            self.hog = _people_hog()
+        except Exception as e:
+            print(f"WARNING: Body detector init failed: {e}")
+            self.hog = None
+        if self.hog is None:
+            self.enabled = False
+            print("WARNING: Body detector unavailable (OpenCV has no HOGDescriptor)")
 
     def detect(self, frame_bgr, gray):
+        if self.hog is None:
+            return []
         boxes, weights = self.hog.detectMultiScale(
             gray,
             winStride=(8, 8),
