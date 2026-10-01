@@ -4,7 +4,7 @@ This is not an Amelia skill. Amelia loads only src/skills/skill_*.py.
 Copy this directory to ~/.hermes/plugins/household/ and enable it there.
 """
 
-from household.tools import (
+from .tools import (
     TOOLS,
     calendar_add,
     calendar_agenda,
