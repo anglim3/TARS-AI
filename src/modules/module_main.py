@@ -412,6 +412,12 @@ def utterance_callback(message):
                 stt_manager.stop_bargein_monitor()
             was_interrupted = pipeline.interrupted
 
+        try:
+            from modules.module_tts import request_outage_voice
+            request_outage_voice(False)
+        except Exception:
+            pass
+
         # Speak follow-up if side effects produced new content (vision result, search summary)
         queue_message(f"DEBUG VOICE: followup_reply={'yes' if _followup_reply else 'no'}, was_interrupted={was_interrupted}")
         followup_tts_dur = 0
@@ -571,9 +577,15 @@ def initialize_managers(mem_manager, char_manager, stt_mgr, ui_mgr, shutdown_evt
 
 def startup_initialization():
     try:
-        queue_message("SYSTEM: Starting servo initialization...")
-        initialize_servos()
-        queue_message("SYSTEM: Servo initialization complete")
+        controls = CONFIG.get('CONTROLS', {})
+        arms_present = CONFIG.get('SERVO', {}).get('arms_present', False)
+        motion_enabled = bool(arms_present or controls.get('enabled') or controls.get('voicemovement'))
+        if motion_enabled:
+            queue_message("SYSTEM: Starting servo initialization...")
+            initialize_servos()
+            queue_message("SYSTEM: Servo initialization complete")
+        else:
+            queue_message("SYSTEM: Servo init skipped (arms_present false)")
         try:
             from modules.module_cputemp import (
                 CPUTempModule,

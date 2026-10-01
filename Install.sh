@@ -595,6 +595,7 @@ Pillow                          # Image processing for ChatUI face animation
 configobj                       # Maintain comments in config.ini during updates
 python-dotenv                   # Load environment variables from a .env file
 requests                        # HTTP library for API interactions
+websocket-client                # xAI streaming speech-to-text
 joblib                          # Efficient serialization of Python objects
 ddgs                            # web search parsing
 qrcode[pil]                     # QR code generation for remote access

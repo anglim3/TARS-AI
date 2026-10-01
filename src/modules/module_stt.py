@@ -754,6 +754,7 @@ class STTManager:
                 "external": self._transcribe_with_server,
                 "openai": self._transcribe_with_openai,
                 "sherpa-onnx": self._transcribe_with_sherpa_onnx,
+                "xai": self._transcribe_with_xai,
             }
             processor = self.config["STT"].get("stt_processor", "fastrtc")
             transcribe_fn = processors.get(processor)
@@ -1016,6 +1017,102 @@ class STTManager:
         except requests.RequestException as e:
             queue_message(f"ERROR: Server transcription request failed: {e}")
         return None
+
+    def _piper_repeat(self, text):
+        """Speak one short line with Piper and do not send a transcript on."""
+        import asyncio
+        try:
+            from modules.module_tts import play_audio_chunks
+            asyncio.run(play_audio_chunks(text, "piper"))
+        except Exception as exc:
+            queue_message(f"ERROR: Piper repeat failed: {exc}")
+
+    def _xai_pcm_frames(self):
+        """Yield 16 kHz PCM after the local energy gate opens.
+
+        Frames before speech stay on the Pi. The caller stops iterating
+        when xAI Smart Turn returns speech_final, which closes the mic.
+        """
+        detected = False
+        silent = 0
+        pre_roll = []
+        max_silent = self.MAX_SILENT_FRAMES
+        with ResamplingInputStream(dtype="int16") as mic:
+            try:
+                from modules.module_tts import needs_mic_flush, clear_mic_flush
+                if needs_mic_flush():
+                    mic.flush()
+                    clear_mic_flush()
+            except Exception:
+                pass
+
+            for _ in range(self.MAX_RECORDING_FRAMES):
+                if is_tts_playing():
+                    return
+                data, _ = mic.read(1600)
+                if not detected:
+                    if self._is_quiet(data):
+                        silent += 1
+                        if silent >= max_silent:
+                            return
+                        pre_roll.append(data)
+                        if len(pre_roll) > 10:
+                            pre_roll.pop(0)
+                        continue
+                    detected = True
+                    for chunk in pre_roll:
+                        yield chunk.tobytes()
+                    pre_roll = []
+                yield data.tobytes()
+
+    def _transcribe_with_xai(self):
+        """Stream the utterance to xAI STT. Smart Turn ends the turn.
+
+        A socket failure discards any partial transcript. Piper asks for
+        a repeat once, and nothing is sent to the language brain.
+        """
+        from modules.module_xai import (
+            STT_REPEAT_LINE,
+            stream_pcm_until_speech_final,
+            xai_api_key,
+        )
+
+        key = xai_api_key()
+        if not key:
+            queue_message("ERROR: XAI_API_KEY is not set")
+            self._piper_repeat(STT_REPEAT_LINE)
+            return None
+
+        user_name = CONFIG.get("CHAR", {}).get("user_name", "")
+        frames = self._xai_pcm_frames()
+        captured = []
+
+        def _capturing():
+            for chunk in frames:
+                captured.append(chunk)
+                yield chunk
+
+        try:
+            text = stream_pcm_until_speech_final(_capturing(), key, user_name)
+        except Exception as exc:
+            queue_message(f"ERROR: xAI STT failed: {exc}")
+            self._piper_repeat(STT_REPEAT_LINE)
+            return None
+        finally:
+            frames.close()
+
+        if text is None:
+            return None
+        if not str(text).strip():
+            self._piper_repeat(STT_REPEAT_LINE)
+            return None
+
+        try:
+            audio = np.concatenate([np.frombuffer(chunk, dtype=np.int16) for chunk in captured])
+            self._last_audio_float32 = audio.astype(np.float32) / 32768.0
+        except Exception:
+            pass
+        return self._emit_result(text)
 
     def _transcribe_with_openai(self):
         """Transcribe and translate audio using OpenAI's Whisper API."""

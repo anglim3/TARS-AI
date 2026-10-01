@@ -117,6 +117,9 @@ text_to_speech_with_pipelining_silero = None
 text_to_speech_with_pipelining_espeak = None
 text_to_speech_with_pipelining_elevenlabs = None
 text_to_speech_with_pipelining_openai = None
+text_to_speech_with_pipelining_xai = None
+# Set while a failure line must be spoken by Piper, the outage voice.
+_force_piper = False
 try:
     from modules.module_piper import text_to_speech_with_pipelining_piper as _piper
     text_to_speech_with_pipelining_piper = _piper
@@ -147,6 +150,18 @@ try:
     text_to_speech_with_pipelining_openai = _openai
 except ImportError:
     pass
+
+try:
+    from modules.module_xai import text_to_speech_with_pipelining_xai as _xai
+    text_to_speech_with_pipelining_xai = _xai
+except Exception as e:
+    queue_message(f"[TTS] xAI module failed to load: {e}")
+
+
+def request_outage_voice(enabled):
+    """Speak the next clip with Piper. Used when Hermes or xAI is down."""
+    global _force_piper
+    _force_piper = bool(enabled)
 
 
 def update_tts_settings(ttsurl):
@@ -207,6 +222,9 @@ def play_audio_stream(tts_stream, samplerate=22050, channels=1, gain=1.0, normal
 
 async def generate_tts_audio(text, ttsoption, is_wakeword=False, ttsurl=None, toggle_charvoice=True, tts_voice=None, emotion=None):
     try:
+        if _force_piper:
+            ttsoption = "piper"
+
         if ttsoption == "espeak" and text_to_speech_with_pipelining_espeak:
             async for chunk in text_to_speech_with_pipelining_espeak(text):
                 yield chunk
@@ -226,6 +244,19 @@ async def generate_tts_audio(text, ttsoption, is_wakeword=False, ttsurl=None, to
         elif ttsoption == "openai" and text_to_speech_with_pipelining_openai:
             async for chunk in text_to_speech_with_pipelining_openai(text, is_wakeword):
                 yield chunk
+
+        elif ttsoption == "xai" and text_to_speech_with_pipelining_xai:
+            produced = False
+            async for chunk in text_to_speech_with_pipelining_xai(text, is_wakeword):
+                if chunk:
+                    produced = True
+                    yield chunk
+            # A missed wake ack stays silent; the listen beep already played.
+            # A missed reply is spoken once by Piper, the outage voice.
+            if not produced and not is_wakeword and text_to_speech_with_pipelining_piper:
+                queue_message("WARNING: xAI TTS failed, speaking with Piper")
+                async for chunk in text_to_speech_with_pipelining_piper(text, emotion=emotion):
+                    yield chunk
 
         elif ttsoption == "external":
             external_url = (CONFIG["TTS"].ttsurl or "").rstrip("/")

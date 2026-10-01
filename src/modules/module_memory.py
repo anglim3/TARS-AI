@@ -894,7 +894,7 @@ class MemoryManager:
     def token_count(self, text: str) -> dict:
         llm_backend = self.config['LLM']['llm_backend']
 
-        if llm_backend == "grok":
+        if llm_backend in ("grok", "hermes"):
             word_count = len(text.split())
             estimated_tokens = int(word_count / 0.75)
             return {"length": estimated_tokens}
