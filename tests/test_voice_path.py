@@ -191,8 +191,11 @@ class PcmSource:
 class ScriptedRealtimeSocket:
     """One reply after the client commits. Appends do not end the turn."""
 
-    def __init__(self, tokens):
+    def __init__(self, tokens, user_after_done=False, user_text="Testing", assistant_text="The lab is empty."):
         self.tokens = tokens
+        self.user_after_done = user_after_done
+        self.user_text = user_text
+        self.assistant_text = assistant_text
         self.sent = []
         self.closed = False
         self.timeout = 3
@@ -226,19 +229,23 @@ class ScriptedRealtimeSocket:
             }))
         elif kind == "input_audio_buffer.commit":
             pcm = base64.b64encode(b"\x02\x00" * 8).decode("ascii")
-            self._inbox.put(json.dumps({
+            heard = json.dumps({
                 "type": "conversation.item.input_audio_transcription.completed",
-                "transcript": "Testing",
-            }))
+                "transcript": self.user_text,
+            })
+            if not self.user_after_done:
+                self._inbox.put(heard)
             self._inbox.put(json.dumps({
                 "type": "response.output_audio_transcript.done",
-                "transcript": "The lab is empty.",
+                "transcript": self.assistant_text,
             }))
             self._inbox.put(json.dumps({
                 "type": "response.output_audio.delta",
                 "delta": pcm,
             }))
             self._inbox.put(json.dumps({"type": "response.done"}))
+            if self.user_after_done:
+                self._inbox.put(heard)
 
     def close(self):
         self.closed = True
@@ -524,6 +531,49 @@ class RealtimeTurnTests(unittest.TestCase):
         self.assertIn("input_audio_buffer.commit", sent_types)
         self.assertNotIn("8642", "\n".join(item for item in socket.sent if isinstance(item, str)))
         self.assertNotIn("/v1/responses", "\n".join(item for item in socket.sent if isinstance(item, str)))
+
+    def test_transcript_after_response_done_still_becomes_the_user_line(self):
+        chunks = (
+            [_tone(5000)] * 3
+            + [_tone(80)] * 2
+            + [_tone(5000)] * 4
+            + [_tone(80)] * 10
+        )
+        source = PcmSource(chunks)
+        socket = ScriptedRealtimeSocket(
+            [0] * 8,
+            user_after_done=True,
+            user_text="testing",
+            assistant_text="yes",
+        )
+        screen = _Screen()
+        seen = {}
+
+        def before_play(result):
+            seen["user"] = result["user"]
+            seen["assistant"] = result["assistant"]
+            xai.publish_turn_lines(screen, "Jack", result["user"], result["assistant"], "TARS")
+
+        result = xai.run_realtime_voice_turn(
+            source,
+            "test-key",
+            "tars-voice-id",
+            "Jack",
+            connect=lambda url, header, timeout: socket,
+            execute_tool=lambda name, arguments: "unused",
+            tools=[],
+            play_pcm=lambda _pcm: None,
+            before_play=before_play,
+            recv_timeout=3,
+        )
+        self.assertEqual(seen["user"], "testing")
+        self.assertEqual(seen["assistant"], "yes")
+        self.assertEqual(result["user"], "testing")
+        self.assertEqual(screen.lines, [
+            ("Jack", "testing", "Jack"),
+            ("TARS", "yes", "TARS"),
+        ])
+        self.assertEqual(screen.streamed, [])
 
     def test_silence_does_not_ask_for_a_reply_or_play(self):
         chunks = [_tone(80)] * 3 + [_tone(80)] * 80

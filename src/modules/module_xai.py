@@ -18,6 +18,7 @@ import io
 import json
 import os
 import threading
+import time
 from urllib.parse import urlencode
 
 import numpy as np
@@ -341,6 +342,7 @@ TURN_TAIL_SECONDS = 0.30
 TURN_SILENCE_SECONDS = 1.0
 TURN_NO_SPEECH_SECONDS = 6.0
 TURN_CAP_SECONDS = 12.0
+USER_TRANSCRIPT_GRACE = 2.5
 REALTIME_TOOL_NAMES = (
     "calendar_agenda",
     "calendar_create",
@@ -855,6 +857,42 @@ def _open_realtime_socket(api_key, voice_id, user_name, tools, connect, timeout)
     return ws, loaded
 
 
+def _wait_for_user_transcript(ws, state, seconds=USER_TRANSCRIPT_GRACE):
+    """Keep reading after response.done until the heard line arrives.
+
+    The input transcript often shows up just after response.done. Without
+    this wait the screen publishes an empty user line and skips it.
+    A timeout ends the wait. It does not fail a reply that already arrived.
+    """
+    if (state.get("user") or "").strip():
+        return
+    deadline = time.monotonic() + seconds
+    while not (state.get("user") or "").strip():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if hasattr(ws, "settimeout"):
+            try:
+                ws.settimeout(remaining)
+            except Exception:
+                pass
+        try:
+            raw = ws.recv()
+        except Exception:
+            return
+        if isinstance(raw, (bytes, bytearray)):
+            if raw:
+                state["audio"].extend(raw)
+            continue
+        event = _parse_event(raw)
+        if event is None:
+            continue
+        _absorb_transcripts(event, state)
+        audio = _audio_bytes_from_event(event)
+        if audio:
+            state["audio"].extend(audio)
+
+
 def _collect_realtime_response(ws, tool_fn, recv_timeout):
     """Buffer reply PCM. Do not play it. The mic hub may still be open."""
     if hasattr(ws, "settimeout"):
@@ -914,6 +952,8 @@ def _collect_realtime_response(ws, tool_fn, recv_timeout):
         state["pending"] = []
         if not pending:
             state["done"] = True
+            if not (state.get("user") or "").strip():
+                _wait_for_user_transcript(ws, state, USER_TRANSCRIPT_GRACE)
             continue
         state["tool_rounds"] += 1
         if state["tool_rounds"] > 4:
