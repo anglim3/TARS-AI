@@ -556,13 +556,9 @@ async def play_audio_chunks(text, config, is_wakeword=False, emotion=None):
                         ])
                     samplerate = 16000
 
-                max_val = np.max(np.abs(data))
-                if max_val > 0:
-                    data = data / max_val
-
-                gain = 1.5
-                data = np.clip(data * gain, -1.0, 1.0)
-
+                # Decoded samples only. Peak-normalize plus a 1.5 gain made
+                # the wake acknowledgment louder than the realtime reply,
+                # which aplay sends with no software scale.
                 sd.play(data, samplerate, device=_output_device)
                 _tts_playing.set()
 

@@ -417,7 +417,7 @@ def load_config():
             "speaker_id_enabled": config.get('STT', 'speaker_id_enabled', fallback='False'),
             "speaker_id_threshold": config.get('STT', 'speaker_id_threshold', fallback='0.75'),
             "mic_amp_gain": config.getfloat('STT', 'mic_amp_gain', fallback=10.0),
-            "silence_margin": config.getfloat('STT', 'silence_margin', fallback=3.0),
+            "silence_margin": config.getfloat('STT', 'silence_margin', fallback=2.0),
         },
         "CHAR": {
             "character_name": character_name,
