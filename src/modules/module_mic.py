@@ -12,6 +12,7 @@ all registered consumers (callback-based and read-based).
 """
 
 import os
+import re
 import time
 import threading
 import collections
@@ -184,6 +185,7 @@ class _AudioHub:
         self._stream = None
         self._native_rate = None
         self._grace_timer = None
+        self._paused = False
 
         # Mutable dicts — only mutated under self._lock
         self._callbacks = {}   # {id: callback_fn}
@@ -224,7 +226,13 @@ class _AudioHub:
             evt.set()
 
     def _ensure_stream(self):
-        """Start the shared stream if not already running. Called under lock."""
+        """Start the shared stream if not already running. Called under lock.
+
+        A paused hub must not reopen the USB input. Playback on this
+        half-duplex card fails while an InputStream is still open.
+        """
+        if self._paused:
+            return
         # Cancel any pending grace-period shutdown
         if self._grace_timer is not None:
             self._grace_timer.cancel()
@@ -265,6 +273,67 @@ class _AudioHub:
                     pass
                 self._stream = None
             self._grace_timer = None
+
+    def _take_stream_locked(self):
+        """Detach the live InputStream. Caller holds self._lock.
+
+        Consumers stay registered. The grace timer is cancelled so it
+        cannot close a stream that playback is about to replace, and it
+        cannot keep the device for another two seconds.
+        """
+        if self._grace_timer is not None:
+            self._grace_timer.cancel()
+            self._grace_timer = None
+        stream = self._stream
+        self._stream = None
+        return stream
+
+    @staticmethod
+    def _stop_stream(stream):
+        if stream is None:
+            return
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+    def force_release_input(self):
+        """Close the USB input immediately, even if a consumer is registered.
+
+        The spectrum visualizer keeps a callback registered for the whole
+        session. Waiting for that callback to leave, or for the two-second
+        grace period, holds the half-duplex card and PortAudio then refuses
+        to open an output stream (PaErrorCode -9985).
+        """
+        with self._lock:
+            stream = self._take_stream_locked()
+        self._stop_stream(stream)
+
+    def pause(self):
+        """Drop the input and refuse to open it again until resume()."""
+        with self._lock:
+            self._paused = True
+            stream = self._take_stream_locked()
+        self._stop_stream(stream)
+
+    def resume(self):
+        """Allow the input to open again for whoever is still registered."""
+        with self._lock:
+            self._paused = False
+            if self._callbacks or self._readers:
+                try:
+                    self._ensure_stream()
+                except Exception:
+                    pass
+
+    @property
+    def input_open(self):
+        """True while the shared PortAudio InputStream exists."""
+        return self._stream is not None
 
     @property
     def native_rate(self):
@@ -576,3 +645,124 @@ def make_resampling_callback(user_callback):
         user_callback(audio, len(audio), time_info, status)
 
     return _cb
+
+
+# ── Half-duplex playback ───────────────────────────────────────────
+#
+# The Pi USB PnP card is half duplex. An OutputStream fails with
+# PaErrorCode -9985 while this hub still has the InputStream open.
+# Reply audio therefore goes out through aplay, after PortAudio has
+# been terminated and the input device has been dropped.
+
+_USB_CARD_RE = re.compile(r"^\s*(\d+)\s+\[")
+
+
+def usb_plughw_device(cards_text=None):
+    """Return plughw for the USB card listed in /proc/asound/cards.
+
+    The card number is the index on the left of that file. The match is
+    the card whose header or description contains USB.
+    """
+    if cards_text is None:
+        try:
+            with open("/proc/asound/cards", encoding="utf-8", errors="replace") as handle:
+                cards_text = handle.read()
+        except OSError:
+            return None
+    current = None
+    usb_index = None
+    for line in str(cards_text).splitlines():
+        match = _USB_CARD_RE.match(line)
+        if match:
+            current = match.group(1)
+            if "USB" in line.upper():
+                usb_index = current
+                break
+        elif current is not None and usb_index is None and "USB" in line.upper():
+            usb_index = current
+            break
+    if usb_index is None:
+        return None
+    return f"plughw:{usb_index},0"
+
+
+def _aplay_pcm(pcm, device, sample_rate):
+    import subprocess
+
+    from modules.module_messageQue import queue_message
+
+    try:
+        completed = subprocess.run(
+            [
+                "aplay",
+                "-D",
+                device,
+                "-f",
+                "S16_LE",
+                "-r",
+                str(int(sample_rate)),
+                "-c",
+                "1",
+                "-t",
+                "raw",
+                "-q",
+            ],
+            input=pcm,
+            check=False,
+        )
+    except FileNotFoundError:
+        queue_message("ERROR: aplay is not installed")
+        return
+    if completed.returncode != 0:
+        queue_message(f"ERROR: aplay exited {completed.returncode}")
+
+
+def play_pcm_half_duplex(
+    pcm,
+    sample_rate=MODEL_RATE,
+    hub=None,
+    aplay=None,
+    terminate=None,
+    initialize=None,
+    cards_text=None,
+):
+    """Play PCM on the USB card after the shared input is gone.
+
+    Returns False without starting playback when the hub stream is still
+    open. PortAudio is terminated for the duration of aplay and started
+    again afterwards. The hub stays paused until aplay returns so a
+    registered visualizer cannot reopen the microphone.
+    """
+    if not pcm:
+        return False
+    hub = _hub if hub is None else hub
+    hub.force_release_input()
+    hub.pause()
+    if hub.input_open:
+        try:
+            hub.resume()
+        except Exception:
+            pass
+        return False
+
+    term = terminate or sd._terminate
+    init = initialize or sd._initialize
+    play = aplay or _aplay_pcm
+    device = usb_plughw_device(cards_text)
+    try:
+        term()
+        if not device:
+            from modules.module_messageQue import queue_message
+            queue_message("ERROR: no USB sound card for playback")
+            return False
+        play(pcm, device, sample_rate)
+        return True
+    finally:
+        try:
+            init()
+        except Exception:
+            pass
+        try:
+            hub.resume()
+        except Exception:
+            pass
