@@ -31,8 +31,165 @@ def _speech(text):
     return str(text or "").strip()
 
 
+
+def _phrase_words(phrase):
+    low = phrase.lower().replace("'", "").replace("\u2019", "")
+    return [word for word in low.replace("-", " ").split() if word]
+
+
+_GENERIC_WORDS = {
+    "light", "lights", "lamp", "lamps", "the", "a", "an", "all", "every",
+    "my", "our", "on", "off", "turn", "please", "switch", "switches",
+}
+
+
+def _name_tokens(name):
+    folded = name.lower().replace("'", "").replace("\u2019", "").replace("-", " ")
+    return [word for word in folded.split() if word not in _GENERIC_WORDS and len(word) >= 3]
+
+
+def _token_hit(phrase_words, token):
+    for word in phrase_words:
+        if word == token:
+            return True
+        if len(word) >= 4 and (token.startswith(word) or word.startswith(token)):
+            return True
+    return False
+
+
+def _entities(states, prefix):
+    found = []
+    for item in states:
+        entity_id = str(item.get("entity_id", ""))
+        if entity_id.startswith(prefix):
+            found.append(item)
+    return found
+
+
+def _named_matches(phrase, items):
+    words = _phrase_words(phrase)
+    matched = []
+    for item in items:
+        name = str((item.get("attributes") or {}).get("friendly_name") or "")
+        if any(_token_hit(words, token) for token in _name_tokens(name)):
+            matched.append(item)
+    return matched
+
+
+def _light_targets(phrase, states):
+    """Named lights alone, or every light when the phrase just says the lights."""
+    lights = _entities(states, "light.")
+    named = _named_matches(phrase, lights)
+    if named:
+        return [item["entity_id"] for item in named]
+    if "light" in phrase.lower():
+        return [item["entity_id"] for item in lights]
+    return []
+
+
+def _friendly(states, entity_id):
+    for item in states:
+        if item.get("entity_id") == entity_id:
+            name = str((item.get("attributes") or {}).get("friendly_name") or "").strip()
+            if name:
+                return name
+    return entity_id
+
+
+def _service_verb(phrase):
+    low = phrase.lower()
+    padded = f" {low}"
+    if " off" in padded or low.startswith("off"):
+        return "turn_off", "off"
+    if " on" in padded or low.startswith("on"):
+        return "turn_on", "on"
+    return None, None
+
+
+def _control_fallback(phrase, client, base, token):
+    service, verb = _service_verb(phrase)
+    if service is None:
+        return None
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        listed = client.get(f"{base}/api/states", headers=headers, timeout=HA_TIMEOUT)
+        states = listed.json() if getattr(listed, "ok", False) else []
+    except Exception:
+        return None
+    if not isinstance(states, list):
+        return None
+    lights = _entities(states, "light.")
+    switches = _entities(states, "switch.")
+    light_ids = _light_targets(phrase, states)
+    switch_ids = []
+    if not light_ids:
+        switch_ids = [item["entity_id"] for item in _named_matches(phrase, switches)]
+    targets = light_ids or switch_ids
+    if not targets:
+        return None
+    domain = "light" if light_ids else "switch"
+    try:
+        done = client.post(
+            f"{base}/api/services/{domain}/{service}",
+            json={"entity_id": targets},
+            headers=headers,
+            timeout=HA_TIMEOUT,
+        )
+    except Exception:
+        return None
+    if getattr(done, "ok", False) is not True:
+        return None
+    every_light = light_ids and len(light_ids) == len(lights) and lights
+    if every_light:
+        return f"Turned the lights {verb}."
+    if len(targets) == 1:
+        return f"Turned {_friendly(states, targets[0])} {verb}."
+    names = ", ".join(_friendly(states, entity_id) for entity_id in targets)
+    return f"Turned {names} {verb}."
+
+
+def device_roster(http=None):
+    """One sentence of live light and switch names. Empty when Home Assistant is down."""
+    token = _env("HA_TOKEN")
+    base = _env("HA_URL").rstrip("/")
+    if not token or not base:
+        return ""
+    client = http or _http()
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        listed = client.get(f"{base}/api/states", headers=headers, timeout=HA_TIMEOUT)
+    except Exception:
+        return ""
+    if getattr(listed, "ok", False) is not True:
+        return ""
+    try:
+        states = listed.json()
+    except Exception:
+        return ""
+    if not isinstance(states, list):
+        return ""
+    bits = []
+    for item in states:
+        entity_id = str(item.get("entity_id", ""))
+        if entity_id.startswith("light."):
+            domain = "light"
+        elif entity_id.startswith("switch."):
+            domain = "switch"
+        else:
+            continue
+        name = str((item.get("attributes") or {}).get("friendly_name") or entity_id)
+        bits.append(f"{name} ({domain}, {item.get('state')})")
+    if not bits:
+        return ""
+    return (
+        "Known devices: " + "; ".join(bits) + ". "
+        "The lights means every light. "
+        "A named device is controlled alone."
+    )
+
+
 def home(params, http=None, **kwargs):
-    """POST the user's phrase to Home Assistant conversation."""
+    """Control an on/off request from the live entity list, or ask conversation."""
     del kwargs
     phrase = _speech((params or {}).get("text") or (params or {}).get("phrase"))
     if not phrase:
@@ -42,14 +199,17 @@ def home(params, http=None, **kwargs):
     if not token or not base:
         return "Home Assistant is not configured."
     client = http or _http()
+    # Conversation often returns a non-error sentence that never switched
+    # the lights. On and off are decided from the live entity list first.
+    direct = _control_fallback(phrase, client, base, token)
+    if direct:
+        return direct
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     try:
         response = client.post(
             f"{base}/api/conversation/process",
             json={"text": phrase},
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             timeout=HA_TIMEOUT,
         )
     except Exception:
@@ -101,6 +261,22 @@ def _calendar_id():
     return _env("CALENDAR_ID") or "primary"
 
 
+def _clock(start, zone):
+    """Speak a calendar timestamp in the calendar zone, not raw UTC."""
+    if "T" not in (start or ""):
+        return start or ""
+    try:
+        dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(zone)
+    except ValueError:
+        return start
+    hour = dt.strftime("%I").lstrip("0")
+    minute = dt.strftime("%M")
+    ampm = dt.strftime("%p").lower()
+    if minute == "00":
+        return f"{hour}{ampm}"
+    return f"{hour}:{minute}{ampm}"
+
+
 def calendar_agenda(params, http=None, **kwargs):
     """Remaining events today, or tomorrow when the call says so."""
     del kwargs
@@ -136,15 +312,40 @@ def calendar_agenda(params, http=None, **kwargs):
     if getattr(response, "ok", False) is not True:
         return "Calendar returned an error."
     items = (response.json() or {}).get("items") or []
+    label = "tomorrow" if when == "tomorrow" else "the rest of today"
+    if not items and when != "tomorrow":
+        start_day = now + timedelta(days=1)
+        window_start = start_day.replace(hour=0, minute=0, second=0, microsecond=0)
+        window_end = start_day.replace(hour=23, minute=59, second=59, microsecond=0)
+        try:
+            response = client.get(
+                url,
+                params={
+                    "timeMin": window_start.isoformat(),
+                    "timeMax": window_end.isoformat(),
+                    "singleEvents": "true",
+                    "orderBy": "startTime",
+                },
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=HA_TIMEOUT,
+            )
+        except Exception:
+            response = None
+        if response is not None and getattr(response, "ok", False) is True:
+            later = (response.json() or {}).get("items") or []
+            if later:
+                items = later
+                label = "tomorrow"
     if not items:
-        label = "tomorrow" if when == "tomorrow" else "the rest of today"
         return f"Nothing on your calendar for {label}."
     lines = []
     for item in items[:5]:
         title = item.get("summary") or "untitled"
         start = (item.get("start") or {}).get("dateTime") or (item.get("start") or {}).get("date") or ""
-        lines.append(f"{title} at {start}" if start else title)
-    return "; ".join(lines)
+        spoken = _clock(start, zone) if start else ""
+        lines.append(f"{title} at {spoken}" if spoken else title)
+    prefix = "Tomorrow: " if label == "tomorrow" and when != "tomorrow" else ""
+    return prefix + "; ".join(lines)
 
 
 def calendar_add(params, http=None, **kwargs):
@@ -303,7 +504,7 @@ _NO_INVENT = (
 TOOLS = [
     {
         "name": "home",
-        "description": "Send the user's words, unchanged, to Home Assistant. " + _NO_INVENT,
+        "description": "Send the user's words, unchanged, to Home Assistant. The lights means every light. A named device is controlled alone. " + _NO_INVENT,
         "parameters": {
             "type": "object",
             "properties": {
