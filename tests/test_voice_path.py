@@ -1,8 +1,11 @@
 """Voice-path checks that do not need API keys or a running Hermes."""
 
+import base64
 import json
 import os
+import queue
 import sys
+import tempfile
 import threading
 import unittest
 
@@ -158,6 +161,183 @@ class VoicePathTests(unittest.TestCase):
             ]
         }
         self.assertEqual(xai.assistant_text_from_response(payload), "Kitchen lights are off.")
+
+
+
+class ScriptedRealtimeSocket:
+    """Serve one tool-calling turn when the client appends audio."""
+
+    def __init__(self):
+        self.sent = []
+        self.closed = False
+        self._inbox = queue.Queue()
+        self._appends = 0
+        self._continued = False
+        self._lock = threading.Lock()
+
+    def settimeout(self, _timeout):
+        return None
+
+    def recv(self):
+        item = self._inbox.get(timeout=3)
+        if item is None:
+            raise ConnectionError("closed")
+        return item
+
+    def send(self, data, opcode=None):
+        with self._lock:
+            self.sent.append(data)
+            if not isinstance(data, str):
+                return
+            event = json.loads(data)
+        kind = event.get("type")
+        if kind == "session.update":
+            self._inbox.put(json.dumps({"type": "session.updated"}))
+        elif kind == "input_audio_buffer.append":
+            with self._lock:
+                self._appends += 1
+                appends = self._appends
+            if appends == 2:
+                pcm = base64.b64encode(b"\x01\x00" * 8).decode("ascii")
+                self._inbox.put(json.dumps({"type": "input_audio_buffer.speech_stopped"}))
+                self._inbox.put(json.dumps({
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "transcript": "what is on today",
+                }))
+                self._inbox.put(json.dumps({
+                    "type": "response.output_audio.delta",
+                    "delta": pcm,
+                }))
+                self._inbox.put(json.dumps({
+                    "type": "response.function_call_arguments.done",
+                    "name": "calendar_agenda",
+                    "call_id": "call_1",
+                    "arguments": json.dumps({"when": "today"}),
+                }))
+                self._inbox.put(json.dumps({"type": "response.done"}))
+        elif kind == "conversation.item.create":
+            if not self._continued:
+                self._continued = True
+                pcm = base64.b64encode(b"\x02\x00" * 4).decode("ascii")
+                self._inbox.put(json.dumps({
+                    "type": "response.output_audio.delta",
+                    "delta": pcm,
+                }))
+                self._inbox.put(json.dumps({
+                    "type": "response.output_audio_transcript.done",
+                    "transcript": "Nothing on the calendar.",
+                }))
+                self._inbox.put(json.dumps({"type": "response.done"}))
+
+    def close(self):
+        self.closed = True
+        self._inbox.put(None)
+
+
+class RealtimeVoiceTests(unittest.TestCase):
+    def test_realtime_tools_skip_home_and_keep_calendar_and_tasks(self):
+        tools = xai.realtime_function_tools()
+        names = [item["name"] for item in tools]
+        self.assertIn("calendar_agenda", names)
+        self.assertIn("tasks_list", names)
+        self.assertIn("tasks_add", names)
+        self.assertIn("tasks_complete", names)
+        self.assertIn("calendar_create", names)
+        self.assertNotIn("home", names)
+        self.assertTrue(all(item["type"] == "function" for item in tools))
+
+    def test_missing_household_env_names_are_filled_without_logging_values(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, ".env")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("CALENDAR_ID=cal-test\n")
+                handle.write("CALENDAR_TIMEZONE=America/New_York\n")
+                handle.write("HA_TOKEN=should-not-load\n")
+            previous_id = os.environ.pop("CALENDAR_ID", None)
+            previous_zone = os.environ.pop("CALENDAR_TIMEZONE", None)
+            try:
+                filled = xai.load_missing_household_env(path)
+                self.assertGreaterEqual(filled, 1)
+                self.assertEqual(os.environ.get("CALENDAR_ID"), "cal-test")
+                self.assertEqual(os.environ.get("CALENDAR_TIMEZONE"), "America/New_York")
+                self.assertNotEqual(os.environ.get("HA_TOKEN"), "should-not-load")
+            finally:
+                if previous_id is None:
+                    os.environ.pop("CALENDAR_ID", None)
+                else:
+                    os.environ["CALENDAR_ID"] = previous_id
+                if previous_zone is None:
+                    os.environ.pop("CALENDAR_TIMEZONE", None)
+                else:
+                    os.environ["CALENDAR_TIMEZONE"] = previous_zone
+
+    def test_silence_does_not_open_realtime_socket(self):
+        def connect(url, header, timeout):
+            raise AssertionError("socket opened with no audio")
+
+        self.assertIsNone(xai.run_realtime_voice_turn(
+            iter(()),
+            "test-key",
+            "voice-test",
+            "Ada",
+            on_pcm=lambda _chunk: None,
+            connect=connect,
+            tools=[],
+        ))
+
+    def test_realtime_turn_uses_custom_voice_and_returns_tool_audio(self):
+        socket = ScriptedRealtimeSocket()
+        heard = []
+        calls = []
+
+        def connect(url, header, timeout):
+            self.assertTrue(url.startswith("wss://api.x.ai/v1/realtime"))
+            self.assertIn("model=grok-voice-latest", url)
+            self.assertIn("Authorization: Bearer test-key", header)
+            self.assertNotIn("8642", url)
+            return socket
+
+        def execute_tool(name, arguments):
+            calls.append((name, arguments))
+            return "Nothing on the calendar for the rest of today."
+
+        result = xai.run_realtime_voice_turn(
+            [b"\x00\x01" * 20, b"\x00\x02" * 20],
+            "test-key",
+            "voice-test",
+            "Ada",
+            on_pcm=heard.append,
+            connect=connect,
+            execute_tool=execute_tool,
+            tools=xai.realtime_function_tools(),
+            recv_timeout=5,
+        )
+        self.assertTrue(socket.closed)
+        self.assertGreaterEqual(len(heard), 2)
+        self.assertEqual(calls[0][0], "calendar_agenda")
+        self.assertIn("today", calls[0][1])
+        self.assertEqual(result["user"], "what is on today")
+        self.assertEqual(result["assistant"], "Nothing on the calendar.")
+        blob = "\n".join(item for item in socket.sent if isinstance(item, str))
+        self.assertNotIn("8642", blob)
+        self.assertNotIn("/v1/responses", blob)
+        session = json.loads(socket.sent[0])
+        self.assertEqual(session["session"]["voice"], "voice-test")
+        names = [item["name"] for item in session["session"]["tools"]]
+        self.assertIn("calendar_agenda", names)
+        self.assertIn("tasks_list", names)
+        self.assertIn("tasks_add", names)
+        self.assertNotIn("home", names)
+        outputs = [
+            json.loads(item)
+            for item in socket.sent
+            if isinstance(item, str) and '"function_call_output"' in item
+        ]
+        self.assertEqual(outputs[0]["item"]["call_id"], "call_1")
+        self.assertTrue(any(
+            isinstance(item, str) and json.loads(item).get("type") == "response.create"
+            for item in socket.sent
+        ))
 
 
 if __name__ == "__main__":

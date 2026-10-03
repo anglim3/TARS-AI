@@ -723,6 +723,8 @@ class STTManager:
 
     def _stt_processing_loop(self):
         queue_message("INFO: Starting STT processing loop...")
+        if CONFIG.get("LLM", {}).get("llm_backend") == "xai-realtime":
+            queue_message("INFO: Voice path is xAI realtime. Hermes is not on this path.")
         while self.running and not self.shutdown_event.is_set():
             # Skip processing if paused (e.g., during video playback)
             if self.is_paused():
@@ -1068,6 +1070,10 @@ class STTManager:
     def _transcribe_with_xai(self):
         """Stream the utterance to xAI STT. Smart Turn ends the turn.
 
+        When the language backend is xAI realtime, this turn never calls
+        the loopback agent. Audio goes to the realtime socket and the
+        speaker plays the audio that comes back.
+
         A socket failure discards any partial transcript. Piper asks for
         a repeat once, and nothing is sent to the language brain.
         """
@@ -1076,6 +1082,9 @@ class STTManager:
             stream_pcm_until_speech_final,
             xai_api_key,
         )
+
+        if CONFIG.get("LLM", {}).get("llm_backend") == "xai-realtime":
+            return self._converse_with_xai_realtime()
 
         key = xai_api_key()
         if not key:
@@ -1113,6 +1122,66 @@ class STTManager:
         except Exception:
             pass
         return self._emit_result(text)
+
+
+    def _converse_with_xai_realtime(self):
+        """One wake turn: mic PCM to xAI realtime, speaker PCM back."""
+        from modules.module_state import TarsState, set_tars_state
+        from modules.module_tts import Pcm16Player
+        from modules.module_xai import (
+            STT_REPEAT_LINE,
+            run_realtime_voice_turn,
+            xai_api_key,
+            xai_tts_voice_id,
+        )
+
+        queue_message("INFO: xAI realtime voice turn")
+        key = xai_api_key()
+        voice_id = xai_tts_voice_id()
+        if not key or not voice_id:
+            queue_message("ERROR: xAI realtime needs XAI_API_KEY and XAI_TTS_VOICE_ID")
+            self._piper_repeat(STT_REPEAT_LINE)
+            return None
+
+        user_name = CONFIG.get("CHAR", {}).get("user_name", "")
+        frames = self._xai_pcm_frames()
+        player = Pcm16Player()
+        set_tars_state(TarsState.LISTENING)
+        try:
+            result = run_realtime_voice_turn(
+                frames,
+                key,
+                voice_id,
+                user_name,
+                on_pcm=player.write,
+            )
+        except Exception as exc:
+            queue_message(f"ERROR: xAI realtime failed: {exc}")
+            self._piper_repeat(STT_REPEAT_LINE)
+            return None
+        finally:
+            try:
+                frames.close()
+            except Exception:
+                pass
+            player.close()
+
+        if not result:
+            return None
+
+        heard = (result.get("user") or "").strip()
+        said = (result.get("assistant") or "").strip()
+        queue_message("ROUND: path=xai-realtime")
+        if self.ui_manager and (heard or said):
+            try:
+                label = user_name or "User"
+                self.ui_manager.update_data(label, heard or "(voice)", self._character_name)
+                if said:
+                    self.ui_manager.update_streaming_data(said)
+            except Exception:
+                pass
+        set_tars_state(TarsState.LISTENING)
+        return None
 
     def _transcribe_with_openai(self):
         """Transcribe and translate audio using OpenAI's Whisper API."""

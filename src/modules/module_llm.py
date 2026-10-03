@@ -256,6 +256,10 @@ def _maybe_play_thinking_response():
 
 def get_completion(user_prompt, istext=True, image_b64=None, source="voice"):
 
+    if CONFIG['LLM'].get('llm_backend') == 'xai-realtime':
+        queue_message("INFO: xAI realtime owns the voice turn. Hermes was not called.")
+        return ""
+
     if CONFIG['LLM'].get('llm_backend') == 'hermes':
         parsed = _hermes_voice_turn(user_prompt)
         if not parsed:
@@ -384,6 +388,10 @@ def process_completion(prompt, image_b64=None):
     or a plain string on error.
     """
     def _get_parsed(prompt):
+        if CONFIG['LLM'].get('llm_backend') == 'xai-realtime':
+            queue_message("INFO: xAI realtime owns the voice turn. Hermes was not called.")
+            return {"reply": "", "function_calls": [], "new_memories": []}
+
         if CONFIG['LLM'].get('llm_backend') == 'hermes':
             return _hermes_voice_turn(prompt)
 

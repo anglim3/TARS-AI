@@ -27,9 +27,9 @@ enable_thinking_responses = false
 thinking_responses = ["Let me think...","soooo.....","soo....","Let's seeee...","Let me seeee...","Let's see.....","One Moment...","One Moment","hum","humm","Analyzing...","Processing...","Calculating...","Computing...","Running the numbers...","Checking...","One moment...","Scanning data...","Assessing...","Evaluating...","Let me calculate...","Working on it...","Just a moment...","Reviewing...","Compiling...","Cross-referencing...","Thinking it through...","Give me a second...","Hold on..."]
 
 [LLM]
-# AI backend: openai | grok | deepinfra | other | hermes
-# hermes posts the heard line to loopback POST /v1/responses. json_mode stays off.
-llm_backend = hermes
+# AI backend: openai | grok | deepinfra | other | hermes | xai-realtime
+# xai-realtime streams mic audio to the speech-to-speech socket. hermes is the older text loopback.
+llm_backend = xai-realtime
 # API endpoint. hermes uses the loopback API root. other uses this URL as set.
 base_url = http://127.0.0.1:8642/v1
 # Model name for openai / deepinfra backend (e.g., gpt-4o-mini)
