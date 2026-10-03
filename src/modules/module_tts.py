@@ -13,6 +13,7 @@ Handles TTS functionality to convert text into audio using:
 import requests
 import os
 import time
+import queue
 import threading
 from datetime import datetime
 import numpy as np
@@ -190,6 +191,63 @@ def update_tts_settings(ttsurl):
             queue_message(f"INFO: Response: {response.text}")
     except Exception as e:
         queue_message(f"ERROR: TTS update failed: {e}")
+
+
+def play_pcm16_chunks(chunks, samplerate=16000):
+    """Play raw little-endian PCM16 on the selected speaker."""
+    _resolve_output_device()
+    _tts_cancel_event.clear()
+    _tts_playing.set()
+    try:
+        with sd.OutputStream(
+            samplerate=samplerate,
+            channels=1,
+            dtype="int16",
+            blocksize=2048,
+            device=_output_device,
+        ) as stream:
+            for chunk in chunks:
+                if _tts_cancel_event.is_set():
+                    break
+                if not chunk:
+                    continue
+                audio = np.frombuffer(chunk, dtype=np.int16)
+                if audio.size == 0:
+                    continue
+                stream.write(audio)
+    except Exception as exc:
+        queue_message(f"ERROR: PCM playback failed: {exc}")
+    finally:
+        _tts_playing.clear()
+        _tts_needs_flush.set()
+
+
+class Pcm16Player:
+    """Queue PCM16 chunks onto the speaker without blocking the caller."""
+
+    def __init__(self, samplerate=16000):
+        self.samplerate = samplerate
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def write(self, pcm):
+        if pcm:
+            self._queue.put(pcm)
+
+    def close(self):
+        self._queue.put(None)
+        self._thread.join(timeout=60)
+
+    def _run(self):
+        def chunks():
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    return
+                yield item
+        play_pcm16_chunks(chunks(), self.samplerate)
+
 
 def play_audio_stream(tts_stream, samplerate=22050, channels=1, gain=1.0, normalize=False):
     _resolve_output_device()

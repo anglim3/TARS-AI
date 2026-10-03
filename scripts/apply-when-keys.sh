@@ -40,7 +40,7 @@ TARGETS = {
         "ttsoption": "xai",
     },
     "LLM": {
-        "llm_backend": "hermes",
+        "llm_backend": "xai-realtime",
         "base_url": "http://127.0.0.1:8642/v1",
         "json_mode": "False",
     },

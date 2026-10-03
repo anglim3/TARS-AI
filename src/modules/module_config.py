@@ -575,6 +575,7 @@ def get_api_key(llm_backend: str) -> str:
         "deepinfra": "DEEPINFRA_API_KEY",
         "other": "OTHER_API_KEY",
         "hermes": "HERMES_API_KEY",
+        "xai-realtime": "XAI_API_KEY",
     }
     if llm_backend not in backend_to_env_var:
         print(f"WARNING: Unsupported LLM backend '{llm_backend}', skipping API key lookup.")
@@ -675,8 +676,8 @@ CONFIG_METADATA = {
         '__description__': 'Configure the AI brain that generates TARS responses',
         'llm_backend': {
             'label': 'AI Backend',
-            'options': ['openai', 'grok', 'deepinfra', 'other', 'hermes'],
-            'description': 'Choose which AI service TARS uses to generate responses. "hermes" posts the heard line to a Hermes agent on loopback (POST /v1/responses) and speaks the final sentence. It requires HERMES_API_KEY and leaves JSON mode off. "openai" uses OpenAI (GPT models) — auto-fills the URL, requires OPENAI_API_KEY in .env. "grok" uses xAI\'s Grok — auto-fills the URL, requires GROK_API_KEY in .env. "deepinfra" uses DeepInfra (cheap hosted models) — auto-fills the URL, requires DEEPINFRA_API_KEY in .env. "other" is for any OpenAI-compatible API — you set the URL yourself and it is preserved when switching backends.'
+            'options': ['openai', 'grok', 'deepinfra', 'other', 'hermes', 'xai-realtime'],
+            'description': 'Choose which AI service the robot uses to generate responses. "xai-realtime" streams the microphone to the xAI speech-to-speech socket and plays the returned audio with XAI_TTS_VOICE_ID. Calendar and task tools run on that socket. Hermes is not called. "hermes" posts the heard line to a Hermes agent on loopback (POST /v1/responses) and speaks the final sentence. It requires HERMES_API_KEY and leaves JSON mode off. "openai" uses OpenAI (GPT models) — auto-fills the URL, requires OPENAI_API_KEY in .env. "grok" uses xAI\'s Grok — auto-fills the URL, requires GROK_API_KEY in .env. "deepinfra" uses DeepInfra (cheap hosted models) — auto-fills the URL, requires DEEPINFRA_API_KEY in .env. "other" is for any OpenAI-compatible API — you set the URL yourself and it is preserved when switching backends.'
         },
         'base_url': {
             'label': 'Base URL',
