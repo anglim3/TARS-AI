@@ -1027,16 +1027,12 @@ class STTManager:
         except Exception as exc:
             queue_message(f"ERROR: Piper repeat failed: {exc}")
 
-    def _xai_pcm_frames(self):
-        """Yield 16 kHz PCM after the local energy gate opens.
+    def _realtime_pcm_frames(self):
+        """Yield 16 kHz PCM for one realtime turn. The caller closes this.
 
-        Frames before speech stay on the Pi. The caller stops iterating
-        when xAI Smart Turn returns speech_final, which closes the mic.
+        Closing the generator drops this reader. The spectrum visualizer
+        can still be holding the shared hub; playback releases that itself.
         """
-        detected = False
-        silent = 0
-        pre_roll = []
-        max_silent = self.MAX_SILENT_FRAMES
         with ResamplingInputStream(dtype="int16") as mic:
             try:
                 from modules.module_tts import needs_mic_flush, clear_mic_flush
@@ -1045,74 +1041,65 @@ class STTManager:
                     clear_mic_flush()
             except Exception:
                 pass
-
-            for _ in range(self.MAX_RECORDING_FRAMES):
-                if is_tts_playing():
-                    return
-                data, _ = mic.read(1600)
-                if not detected:
-                    if self._is_quiet(data):
-                        silent += 1
-                        if silent >= max_silent:
-                            return
-                        pre_roll.append(data)
-                        if len(pre_roll) > 10:
-                            pre_roll.pop(0)
-                        continue
-                    detected = True
-                    for chunk in pre_roll:
-                        yield chunk.tobytes()
-                    pre_roll = []
+            while True:
+                data, _overflow = mic.read(1600)
                 yield data.tobytes()
 
     def _transcribe_with_xai(self):
-        """Stream the utterance to xAI STT. Smart Turn ends the turn.
+        """One wake is one xAI realtime turn.
 
-        A socket failure discards any partial transcript. Piper asks for
-        a repeat once, and nothing is sent to the language brain.
+        The listen loop lives in the realtime client. This method does not
+        add a second silence timer, and it does not hand the line to Hermes.
         """
         from modules.module_xai import (
             STT_REPEAT_LINE,
-            stream_pcm_until_speech_final,
+            publish_turn_lines,
+            run_realtime_voice_turn,
             xai_api_key,
+            xai_tts_voice_id,
         )
 
         key = xai_api_key()
-        if not key:
-            queue_message("ERROR: XAI_API_KEY is not set")
+        voice_id = xai_tts_voice_id()
+        if not key or not voice_id:
+            queue_message("ERROR: xAI realtime needs XAI_API_KEY and XAI_TTS_VOICE_ID")
             self._piper_repeat(STT_REPEAT_LINE)
             return None
 
-        user_name = CONFIG.get("CHAR", {}).get("user_name", "")
-        frames = self._xai_pcm_frames()
-        captured = []
+        user_name = CONFIG.get("CHAR", {}).get("user_name", "") or "User"
+        queue_message("INFO: xAI realtime voice turn")
+        frames = self._realtime_pcm_frames()
 
-        def _capturing():
-            for chunk in frames:
-                captured.append(chunk)
-                yield chunk
+        def before_play(result):
+            heard = (result.get("user") or "").strip()
+            said = (result.get("assistant") or "").strip()
+            queue_message("ROUND: path=xai-realtime")
+            if self.ui_manager and (heard or said):
+                publish_turn_lines(
+                    self.ui_manager,
+                    user_name,
+                    heard,
+                    said,
+                    self._character_name,
+                )
 
         try:
-            text = stream_pcm_until_speech_final(_capturing(), key, user_name)
+            run_realtime_voice_turn(
+                frames,
+                key,
+                voice_id,
+                user_name,
+                before_play=before_play,
+            )
         except Exception as exc:
-            queue_message(f"ERROR: xAI STT failed: {exc}")
+            queue_message(f"ERROR: xAI realtime failed: {exc}")
             self._piper_repeat(STT_REPEAT_LINE)
             return None
         finally:
             frames.close()
 
-        if text is None:
-            return None
-        if not str(text).strip():
-            self._piper_repeat(STT_REPEAT_LINE)
-            return None
-
-        try:
-            audio = np.concatenate([np.frombuffer(chunk, dtype=np.int16) for chunk in captured])
-            self._last_audio_float32 = audio.astype(np.float32) / 32768.0
-        except Exception:
-            pass
-        return self._emit_result(text)
+        # The realtime socket already spoke. Do not hand this line to Hermes.
+        return None
 
     def _transcribe_with_openai(self):
         """Transcribe and translate audio using OpenAI's Whisper API."""
