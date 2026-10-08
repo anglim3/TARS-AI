@@ -445,7 +445,8 @@ class WakeWordSystem:
     MODE_MODEL = "model"       # CNN/ONNX neural network (trained model)
     MODE_TEMPLATE = "template"  # Original cosine similarity (template matching)
 
-    def __init__(self, wake_word="hey tars", sample_rate=16000, threshold=0.6, augment_data=True, debug=False, mode=None):
+    def __init__(self, wake_word="hey tars", sample_rate=16000, threshold=0.6, augment_data=True, debug=False, mode=None,
+                 confirm_frames=2, min_snr=1.4, cooldown=3.0, log_candidates=True):
         self.wake_word = wake_word
         self.sample_rate = sample_rate
         self.threshold = threshold
@@ -459,15 +460,20 @@ class WakeWordSystem:
         self.model = None  # OnnxWakeWordModel (model mode) or None (template mode)
         self._using_onnx = False
         self.last_detection_time = 0
-        self.cooldown = 1.5
+        self.cooldown = float(cooldown)
         self.last_check_time = 0
         self.check_interval = 0.1
-        # Confirmation window: require 2 scores above threshold in 5 checks (0.5s)
-        # to avoid single-frame false positives from transient sounds
-        self._recent_scores = deque(maxlen=5)
-        self._confirmation_count = 2
+        # Require N consecutive frames above threshold (not N-of-M) to cut
+        # single-frame false positives from ambient noise.
+        self._confirmation_count = max(1, int(confirm_frames))
+        self._recent_scores = deque(maxlen=max(5, self._confirmation_count))
+        self._consecutive_above = 0
+        # Optional: an accepted streak must also reach this peak (0 = off).
+        self.peak_threshold = 0.0
         self._last_debug_time = 0
         self._peak_score_since_debug = 0.0
+        self._log_candidates = bool(log_candidates)
+        self._last_candidate_log = 0.0
         # Adaptive noise floor — tracks background noise level for SNR gating
         self._noise_floor_init = 0.005
         self._noise_floor = self._noise_floor_init
@@ -477,6 +483,9 @@ class WakeWordSystem:
         # modulates: loud 50 ms frames are about twice the quiet ones.
         # Steady room noise stays near 1.1–1.5. The model threshold is
         # unchanged; this only decides whether the model gets to run.
+        # min_snr is the configured tuning value (logged at startup). The
+        # reject itself is frame contrast, not that mean ratio.
+        self._min_snr = float(min_snr)
         self._min_contrast = 1.75
         self._gate_reject = None
         # While this is in the future, quiet frames must not raise the floor.
@@ -748,6 +757,7 @@ class WakeWordSystem:
         """
         self._noise_floor = self._noise_floor_init
         self._recent_scores.clear()
+        self._consecutive_above = 0
         self.last_detection_time = 0
         self.last_check_time = 0
         self._peak_score_since_debug = 0.0
@@ -861,7 +871,8 @@ class WakeWordSystem:
         if contrast < self._min_contrast:
             return "snr"
         peak = float(np.max(np.abs(audio_window)))
-        if peak / (mean_rms + 1e-8) > 15:
+        # Short wake phrases at a distance can crest above 15. Bangs are far higher.
+        if peak / (mean_rms + 1e-8) > 22:
             return "crest"
         fft_mag = np.abs(np.fft.rfft(audio_window))
         freqs = np.fft.rfftfreq(len(audio_window), 1.0 / self.sample_rate)
@@ -918,9 +929,26 @@ class WakeWordSystem:
                         if score >= self.threshold:
                             break
 
-        # Confirmation window
+        # Confirmation: N consecutive frames above threshold.
         self._recent_scores.append(score)
-        above_count = sum(1 for s in self._recent_scores if s >= self.threshold)
+        if score >= self.threshold:
+            self._consecutive_above += 1
+        else:
+            self._consecutive_above = 0
+        above_count = self._consecutive_above
+
+        if self._log_candidates and score >= max(0.35, self.threshold * 0.7):
+            now = time.time()
+            if now - self._last_candidate_log >= 0.5:
+                self._last_candidate_log = now
+                try:
+                    from modules.module_messageQue import queue_message
+                    queue_message(
+                        f"INFO: wake candidate score={score:.3f} thr={self.threshold:.2f} "
+                        f"streak={above_count}/{self._confirmation_count} gate=pending"
+                    )
+                except Exception:
+                    pass
 
         # Debug output — single-line update (overwrites previous)
         if self.debug and score > 0.1:
@@ -928,16 +956,45 @@ class WakeWordSystem:
             bar = "\u2588" * filled + "\u2591" * (30 - filled)
             print(f"\r  [atomik] {bar} {score:.3f}/{self.threshold:.3f} [{above_count}/{self._confirmation_count}]   ", end="", flush=True)
 
+        if above_count >= self._confirmation_count and self.peak_threshold > 0:
+            streak = list(self._recent_scores)[-self._confirmation_count:]
+            if max(streak) < self.peak_threshold:
+                if self._log_candidates:
+                    try:
+                        from modules.module_messageQue import queue_message
+                        queue_message(
+                            f"INFO: wake candidate score={score:.3f} thr={self.threshold:.2f} "
+                            f"peak={max(streak):.3f}<{self.peak_threshold:.2f} gate=peak accepted=no"
+                        )
+                    except Exception:
+                        pass
+                self._recent_scores.clear()
+                self._consecutive_above = 0
+                return False, score
+
         if above_count >= self._confirmation_count:
-            if not self._is_speech_like(audio_window):
+            # Skip speechlike when the score is clearly above threshold.
+            # A distant wake was being rejected as speechlike just over the line.
+            if score < (self.threshold + 0.12) and not self._is_speech_like(audio_window):
                 self._gate_reject = "speechlike"
+                if self._log_candidates:
+                    try:
+                        from modules.module_messageQue import queue_message
+                        queue_message(
+                            f"INFO: wake candidate score={score:.3f} thr={self.threshold:.2f} "
+                            f"gate=speechlike accepted=no"
+                        )
+                    except Exception:
+                        pass
                 if self.debug:
                     print(f"\r  [atomik] rejected: not speech-like                                    ", flush=True)
                 self._recent_scores.clear()
+                self._consecutive_above = 0
                 return False, score
 
             self.last_detection_time = time.time()
             self._recent_scores.clear()
+            self._consecutive_above = 0
             if self.debug:
                 print(f"\r  [atomik] >>> WAKE WORD DETECTED ({score:.3f}) <<<                        ", flush=True)
             return True, score
@@ -1128,9 +1185,6 @@ class WakeWordSystem:
                 if self.model.meta:
                     f1 = self.model.meta.get("f1_score", 0)
                     meta_info = f", f1={f1:.1%}"
-                    # ONNX model was trained on clean synthetic TTS audio.
-                    # Real mic audio scores higher, so bump the threshold.
-                    self.threshold = min(self.threshold + 0.25, 0.95)
                 print(f"INFO: Loaded universal ONNX model ({size_kb:.0f}KB{meta_info}, threshold={self.threshold:.2f})")
                 return True
             except Exception as e:

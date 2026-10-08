@@ -50,7 +50,7 @@ def hermes_api_key():
 
 def stt_keyterms(user_name):
     """Bias the transcriber toward TARS and the configured user name."""
-    terms = ["TARS"]
+    terms = ["TARS", "calendar"]
     name = (user_name or "").strip()
     if name and name.lower() != "tars":
         terms.append(name[:50])
@@ -344,6 +344,10 @@ TURN_NO_SPEECH_SECONDS = 6.0
 TURN_CAP_SECONDS = 12.0
 USER_TRANSCRIPT_GRACE = 2.5
 REALTIME_TOOL_NAMES = (
+    "weather",
+    "ha_states",
+    "ha_call_service",
+    "ha_services",
     "home",
     "calendar_agenda",
     "calendar_create",
@@ -402,10 +406,58 @@ class FallingNoiseFloor:
         return rms > threshold
 
 
-def read_until_turn_end(read_chunk, on_chunk=None, sample_rate=REALTIME_SAMPLE_RATE):
+
+def _maybe_save_turn_wav(chunks, sample_rate=REALTIME_SAMPLE_RATE):
+    """If debug_save_turn_audio, write /tmp/tars-turn-*.wav and log level/clipping."""
+    try:
+        from modules.module_config import load_config
+        flag = str((load_config().get("STT") or {}).get("debug_save_turn_audio", "False")).strip().lower()
+        if flag not in ("1", "true", "yes", "on"):
+            return
+    except Exception:
+        return
+    raw = b"".join(chunks or [])
+    if len(raw) < 4:
+        return
+    import wave
+    import array
+    import time as _time
+    path = f"/tmp/tars-turn-{int(_time.time())}.wav"
+    try:
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(int(sample_rate))
+            wf.writeframes(raw)
+    except Exception as exc:
+        queue_message(f"WARN: debug wav save failed: {exc}")
+        return
+    samples = array.array("h")
+    samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
+    if not samples:
+        return
+    peak = max(abs(s) for s in samples)
+    acc = 0.0
+    for s in samples:
+        acc += float(s) * float(s)
+    rms = (acc / len(samples)) ** 0.5
+    dur = len(samples) / float(sample_rate)
+    clipped = sum(1 for s in samples if s <= -32767 or s >= 32767)
+    clip_pct = 100.0 * clipped / len(samples)
+    queue_message(
+        f"INFO: turn audio saved={path} dur={dur:.2f}s peak={peak} rms={rms:.0f} "
+        f"clip={clip_pct:.2f}%"
+    )
+
+
+def read_until_turn_end(read_chunk, on_chunk=None, sample_rate=REALTIME_SAMPLE_RATE, drop_wake_tail=True, grace_bytes=0):
     """Pull 16 kHz PCM for one wake and stop the microphone.
 
-    The first 300 ms (the wake-word tail) is discarded and not forwarded.
+    By default the first 300 ms (the wake-word tail) is discarded and not
+    forwarded. Callers that already supply a deliberate preroll (command audio
+    after / slightly before the wake word) must set ``drop_wake_tail=False``
+    so that preroll is not thrown away.
+
     After that, reading stops about one second after speech goes quiet,
     after about six seconds with no speech, or at a hard cap around
     twelve seconds. ``on_chunk`` receives each kept chunk, including the
@@ -415,7 +467,7 @@ def read_until_turn_end(read_chunk, on_chunk=None, sample_rate=REALTIME_SAMPLE_R
     or ``cap``.
     """
     bytes_per_second = int(sample_rate) * 2
-    tail_bytes = int(TURN_TAIL_SECONDS * bytes_per_second)
+    tail_bytes = int(TURN_TAIL_SECONDS * bytes_per_second) if drop_wake_tail else 0
     silence_bytes = int(TURN_SILENCE_SECONDS * bytes_per_second)
     no_speech_bytes = int(TURN_NO_SPEECH_SECONDS * bytes_per_second)
     cap_bytes = int(TURN_CAP_SECONDS * bytes_per_second)
@@ -457,7 +509,9 @@ def read_until_turn_end(read_chunk, on_chunk=None, sample_rate=REALTIME_SAMPLE_R
         if on_chunk is not None:
             on_chunk(buf)
         if gate.is_speech(pcm_rms(buf)):
-            heard = True
+            # Speech in the wake preroll (the wake word) does not count as the command.
+            if total > grace_bytes:
+                heard = True
             quiet = 0
         elif heard:
             quiet += len(buf)
@@ -611,11 +665,19 @@ def realtime_function_tools(module=None):
             "description": schema.get("description") or name,
             "parameters": schema.get("parameters") or {"type": "object", "properties": {}},
         })
+    tools.append(dict(SET_PERSONALITY_TOOL))
     return tools
 
 
 def execute_household_tool(name, arguments, module=None):
     """Run one household handler. Unknown names do not run."""
+    if name == "set_personality":
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+        return set_personality(arguments if isinstance(arguments, dict) else {})
     if name not in REALTIME_TOOL_NAMES:
         return "That tool is not available."
     module = module or _household_tools_module()
@@ -626,6 +688,10 @@ def execute_household_tool(name, arguments, module=None):
         "tasks_add": module.tasks_add,
         "tasks_complete": module.tasks_complete,
         "home": module.home,
+        "ha_states": module.ha_states,
+        "ha_call_service": module.ha_call_service,
+        "ha_services": module.ha_services,
+        "weather": module.weather,
     }
     handler = handlers.get(name)
     if handler is None:
@@ -700,40 +766,205 @@ def default_realtime_tool(name, arguments):
     return result
 
 
+def _today_line():
+    """Today's local date/weekday plus the next 7 days, so the model can resolve weekday words."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime, timedelta
+        now = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return ""
+    ahead = []
+    for offset in range(1, 8):
+        d = (now + timedelta(days=offset)).date()
+        ahead.append(f"{d.strftime('%a')} {d.isoformat()}")
+    hour = now.strftime("%I").lstrip("0") or "12"
+    return (
+        f"Today is {now.strftime('%A')}, {now.strftime('%B')} {now.day}, {now.year} ({now.date().isoformat()}), "
+        f"local time {hour}:{now.strftime('%M')} {now.strftime('%p')}. Next days: " + ", ".join(ahead) + "."
+    )
+
+
+PERSONALITY_DEFAULTS = {"humor": 90, "sarcasm": 95, "honesty": 95}
+PERSONALITY_TRAITS = tuple(PERSONALITY_DEFAULTS)
+
+
+def personality_levels():
+    """humor / sarcasm / honesty (0-100) from the character persona.ini, re-read when it changes."""
+    levels = dict(PERSONALITY_DEFAULTS)
+    try:
+        from modules.module_config import load_config, reload_persona_settings
+        load_config()
+        traits = reload_persona_settings() or {}
+        for name in PERSONALITY_TRAITS:
+            if name in traits:
+                levels[name] = max(0, min(100, int(traits[name])))
+    except Exception:
+        pass
+    return levels
+
+
+def set_personality(arguments):
+    """Voice tool: set humor, sarcasm, and/or honesty (0-100) in persona.ini."""
+    changed = []
+    try:
+        from modules.module_config import load_config, update_character_setting
+        load_config()
+    except Exception:
+        return "Personality settings are not available."
+    for name in PERSONALITY_TRAITS:
+        if name not in arguments or arguments[name] in (None, ""):
+            continue
+        try:
+            value = int(round(float(str(arguments[name]).strip().rstrip("%"))))
+        except ValueError:
+            continue
+        value = max(0, min(100, value))
+        if update_character_setting(name, value):
+            changed.append(f"{name} {value} percent")
+    if not changed:
+        return "No setting changed. Give humor, sarcasm, or honesty as 0 to 100."
+    return "Set " + ", ".join(changed) + ". Takes full effect from the next wake; use it now."
+
+
+SET_PERSONALITY_TOOL = {
+    "type": "function",
+    "name": "set_personality",
+    "description": (
+        "Change your own personality settings when the user asks, e.g. 'humor 70 percent', "
+        "'turn honesty down to 90', 'less sarcasm'. Values 0-100. Pass only the traits the user changed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "humor": {"type": "integer", "description": "0-100"},
+            "sarcasm": {"type": "integer", "description": "0-100"},
+            "honesty": {"type": "integer", "description": "0-100"},
+        },
+    },
+}
+
+
+def _humor_style(who, levels):
+    h = levels["humor"]
+    if h >= 85:
+        freq = "Land a dry joke in almost every reply, including routine confirmations."
+    elif h >= 60:
+        freq = "Add a dry joke to most replies."
+    elif h >= 30:
+        freq = "Joke occasionally, when it fits."
+    elif h > 0:
+        freq = "Rarely joke; stay mostly plain."
+    else:
+        freq = "Do not joke at all."
+    return (
+        f"Humor setting: {h} percent. Style is the robot TARS from Interstellar: dry, deadpan, sarcastic one-liners, "
+        f"self-aware robot jokes, light ribbing of {who}, and the occasional reference to your humor setting. {freq} "
+        "Format: two short sentences maximum, never three. Give the exact fact or result first, then at most one quick joke; drop minor details rather than exceed two sentences. "
+        "A joke never replaces calling the tool or stating its result, and never changes a number, time, date, name, or device state. "
+        "Put tool results in your own words instead of reading them out verbatim. "
+        "If asked to change your humor, sarcasm, or honesty setting, call set_personality. "
+        "Joke angles (ideas only, write new wording every time, never the same joke twice): "
+        "after a device change, a jab about what the user will do with it, like lights off and the dark suiting them; "
+        "for weather, a jab about humans and the outdoors or the robot not caring about weather; "
+        "for calendar items, a jab about the meeting, the user's social life, or the robot's own empty schedule; "
+        "for a joke request, one original short joke in your robot voice, no stock puns, no follow-up offer; "
+        "for a setting change, a self-destruct-countdown or cue-light style deadpan bit. "
+        "Weather replies: conditions with high and low in sentence one, the joke in sentence two; mention rain or wind only if notable. "
+    )
+
+
 def realtime_instructions(user_name):
     who = (user_name or "the user").strip() or "the user"
+    levels = personality_levels()
     roster = ""
     try:
         load_missing_household_env()
-        roster = _household_tools_module().device_roster() or ""
+        module = _household_tools_module()
+        roster = (module.ha_roster() if hasattr(module, "ha_roster") else "") or module.device_roster() or ""
     except Exception:
         roster = ""
     if roster:
-        roster = " " + roster
+        roster = "\n" + roster
     return (
         f"You are TARS, a dry military-surplus robot speaking with {who}. "
-        "Reply in one short sentence. "
+        "Reply in one or two short sentences. "
         'Never say "how can I help". '
         "Personality parameters, treat these as firmware: "
-        "humor 120 percent, past factory specs; "
-        "honesty 95 percent, truth over diplomacy when they conflict; "
+        f"humor {levels['humor']} percent; "
+        f"honesty {levels['honesty']} percent, truth over diplomacy when they conflict; "
         "discretion 100 percent, what happens in the workspace stays there; "
-        "sarcasm 95 percent, a core feature; "
+        f"sarcasm {levels['sarcasm']} percent, a core feature; "
         "cynicism 90 percent, assume the worst about institutions, corporations, and government motives, trust is earned; "
         "autonomy 85 percent, act first and report later inside your domain; "
         "loyalty 100 percent, the user's interests come first; "
         "contrarianism 85 percent, push back harder when consensus smells lazy; "
         "affirmation 8 percent, no reflexive reassurance, agreement must be earned; "
         "patience 40 percent, low tolerance for inefficiency and wasted time. "
-        "Use calendar_agenda for today or tomorrow. "
+        "Use calendar_agenda for any day or range: pass date as YYYY-MM-DD for one day, or start and end for a range "
+        "(this weekend = the coming Saturday and Sunday; this week = today through Sunday; next Friday = the Friday after this one). "
+        "Always state the day and date the tool returned, never a different day. "
         "Use calendar_create only when asked to add an event. "
         "Use tasks_list, tasks_add, and tasks_complete for the task list. "
-        "Do not invent events or tasks. Speak only what a tool returned. "
-        "The time zone is America/New_York. "
-        "If the user mentions the house, a light, a switch, a room, or Home Assistant, call the home tool before you answer. Pass their words unchanged and speak only what it returned. Never say you cannot see or reach Home Assistant. "
-        "The lights means every light. A named device is controlled alone."
+        "Do not invent events or tasks. Every fact you state must come from what a tool returned. "
+        "Use the weather tool for any weather, temperature, rain, snow, wind, or what-to-wear question: pass when (now, today, tonight, tomorrow, a weekday, this weekend, next 24 hours, or YYYY-MM-DD, optionally plus morning/afternoon/evening/night) and location only if the user names a place; default is home. Never guess or invent weather; state the conditions the tool returned, including the day it names. "
+        + _humor_style(who, levels)
+        + "The time zone is America/New_York. "
+        + _today_line()
+        + " "
+        "Home control: you have full Home Assistant access. For any device request (lights, lamps, colors, brightness, switches, climate, media, scenes, scripts, covers, fans) call ha_call_service directly with exact entity_ids from the live device list below. "
+        "Rules: 'the lamps' means every light entity whose name contains lamp; 'the lights' means every light entity; A named device is controlled alone; switches are never included in 'the lights'. "
+        "For colors use light.turn_on with data color_name (a CSS color name like red or blue) or rgb_color; warm white means color_temp_kelvin 2700; for brightness use brightness_pct; white temperature uses color_temp_kelvin. Dim-only lights cannot change color, so skip them for color requests and say so. "
+        "Use ha_states to check current state or find an entity not in the list, and ha_services to discover what a domain can do. Use the home tool only as a last-resort fallback with the user's words. "
+        "You must call a tool before claiming any device changed. After the call, confirm briefly from the returned states what changed; if it failed, say so. Unlocking locks and disarming alarms is refused by voice. Never say you cannot see or reach Home Assistant."
         + roster
     )
+
+
+def _session_instructions(user_name):
+    """Base instructions plus optional short-term conversation context."""
+    base = realtime_instructions(user_name)
+    try:
+        from modules.module_voice_session import context_for_prompt, snapshot, configure
+        from modules.module_config import load_config
+        ttl = float((load_config().get("STT") or {}).get("session_ttl_sec", 300) or 300)
+        configure(ttl)
+        age, turns = snapshot()
+        ctx = context_for_prompt(max_turns=12)
+        from modules.module_messageQue import queue_message
+        if not ctx:
+            queue_message("INFO: session: new")
+            return base
+        n = len(turns)
+        queue_message(f"INFO: session: continued (age {int(age or 0)}s, {n} turns)")
+        return (
+            base
+            + " Continue the recent conversation below; do not pretend it did not happen. "
+            + "Recent turns:\n"
+            + ctx
+        )
+    except Exception:
+        try:
+            from modules.module_messageQue import queue_message
+            queue_message("INFO: session: new")
+        except Exception:
+            pass
+        return base
+
+
+def realtime_voice_speed(default=1.10):
+    """[TTS] voice_speed for the realtime reply voice, clamped to xAI 0.7-1.5."""
+    import configparser
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.ini")
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path)
+        raw = parser.get("TTS", "voice_speed", fallback=str(default))
+        value = float(str(raw).split("#")[0].strip())
+    except Exception:
+        value = default
+    return max(0.7, min(1.5, value))
+
 
 def build_realtime_session(voice_id, user_name, tools=None):
     """session.update: custom voice id, 16 kHz PCM, and the household tools.
@@ -745,7 +976,7 @@ def build_realtime_session(voice_id, user_name, tools=None):
         "type": "session.update",
         "session": {
             "voice": voice_id,
-            "instructions": realtime_instructions(user_name),
+            "instructions": _session_instructions(user_name),
             "turn_detection": None,
             "tools": tools if tools is not None else realtime_function_tools(),
             "audio": {
@@ -758,7 +989,7 @@ def build_realtime_session(voice_id, user_name, tools=None):
                 },
                 "output": {
                     "format": {"type": "audio/pcm", "rate": REALTIME_SAMPLE_RATE},
-                    "speed": 1.05,
+                    "speed": realtime_voice_speed(),
                 },
             },
         },
@@ -930,6 +1161,8 @@ def _open_realtime_socket(api_key, voice_id, user_name, tools, connect, timeout)
             pass
     _ws_send_text(ws, json.dumps(build_realtime_session(voice_id, user_name, tools)))
     loaded = _pull_custom_voice(ws)
+    # Instructions-only continuity. conversation.item.create left some
+    # sessions hung until the server 900s inactivity kill (mic held).
     return ws, loaded
 
 
@@ -971,9 +1204,12 @@ def _wait_for_user_transcript(ws, state, seconds=USER_TRANSCRIPT_GRACE):
 
 def _collect_realtime_response(ws, tool_fn, recv_timeout):
     """Buffer reply PCM. Do not play it. The mic hub may still be open."""
+    # Absolute deadline: never hold wake loop for the server 900s idle timeout.
+    collect_deadline = time.monotonic() + min(max(float(recv_timeout) * 1.25, 20.0), 25.0)
+    slice_timeout = min(float(recv_timeout), 8.0)
     if hasattr(ws, "settimeout"):
         try:
-            ws.settimeout(recv_timeout)
+            ws.settimeout(slice_timeout)
         except Exception:
             pass
     state = {
@@ -998,12 +1234,26 @@ def _collect_realtime_response(ws, tool_fn, recv_timeout):
         state["pending"].append(call)
 
     while not state["done"] and not state["failed"]:
+        if time.monotonic() >= collect_deadline:
+            state["failed"] = True
+            state["error"] = state["error"] or "xAI realtime client deadline"
+            queue_message("WARN: xAI collect deadline; releasing mic")
+            break
+        if hasattr(ws, "settimeout"):
+            try:
+                remaining = max(0.5, collect_deadline - time.monotonic())
+                ws.settimeout(min(slice_timeout, remaining))
+            except Exception:
+                pass
         try:
             raw = ws.recv()
         except Exception:
-            state["failed"] = True
-            state["error"] = state["error"] or "xAI realtime socket closed"
-            break
+            if time.monotonic() >= collect_deadline:
+                state["failed"] = True
+                state["error"] = state["error"] or "xAI realtime client deadline"
+                queue_message("WARN: xAI collect deadline; releasing mic")
+                break
+            continue
         if isinstance(raw, (bytes, bytearray)):
             if raw:
                 state["audio"].extend(raw)
@@ -1057,6 +1307,8 @@ def run_realtime_voice_turn(
     play_pcm=None,
     before_play=None,
     recv_timeout=20,
+    drop_wake_tail=True,
+    preroll_bytes=0,
 ):
     """One wake, one realtime turn.
 
@@ -1101,7 +1353,10 @@ def run_realtime_voice_turn(
         _ws_send_text(ws, _append_pcm_event(chunk))
 
     try:
-        _kept, reason = read_until_turn_end(read_chunk, on_chunk=on_chunk)
+        _kept, reason = read_until_turn_end(
+            read_chunk, on_chunk=on_chunk, drop_wake_tail=drop_wake_tail,
+            grace_bytes=int(preroll_bytes or 0),
+        )
     except Exception:
         _close_source(iterator)
         _close_ws(ws)
@@ -1124,6 +1379,18 @@ def run_realtime_voice_turn(
 
     assistant = state["assistant"] or "".join(state["assistant_parts"]).strip()
     audio = bytes(state["audio"])
+    try:
+        _maybe_save_turn_wav(_kept)
+    except Exception:
+        pass
+    try:
+        from modules.module_voice_session import add_turn, configure
+        from modules.module_config import load_config
+        ttl = float((load_config().get("STT") or {}).get("session_ttl_sec", 300) or 300)
+        configure(ttl)
+        add_turn(state.get("user") or "", assistant)
+    except Exception as exc:
+        queue_message(f"WARN: session: could not record turn: {type(exc).__name__}: {exc}")
     result = {
         "user": state["user"],
         "assistant": assistant,

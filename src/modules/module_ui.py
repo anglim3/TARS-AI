@@ -831,7 +831,8 @@ class UIManager(threading.Thread):
                     continue
 
                 if self.screensaver_manager:
-                    if self.show_app or self.show_camera:
+                    from modules.module_display_power import panel_should_blank
+                    if self.show_app or self.show_camera or panel_should_blank():
                         if self.screensaver_manager.is_active():
                             self.screensaver_manager.deactivate()
                         self.screensaver_manager.reset_timer()

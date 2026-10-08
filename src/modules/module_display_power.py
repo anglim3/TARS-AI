@@ -19,6 +19,13 @@ _instance = None
 _init_lock = threading.Lock()
 
 
+def panel_should_blank(now=None):
+    """Night is 8pm through 8am. The panel blanks only then."""
+    moment = now if now is not None else time.localtime()
+    hour = moment.tm_hour
+    return hour >= 20 or hour < 8
+
+
 def _log(message):
     try:
         from modules.module_messageQue import queue_message
@@ -102,6 +109,10 @@ class DisplayPower:
     def _run(self):
         while not self._stop.wait(0.5):
             with self._lock:
+                if not panel_should_blank():
+                    if self._blanked:
+                        self._ensure_on()
+                    continue
                 if self._suspended or self._blanked or self._idle_from is None:
                     continue
                 if time.monotonic() - self._idle_from < self._idle_sec:

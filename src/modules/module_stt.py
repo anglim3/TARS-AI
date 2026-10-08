@@ -75,6 +75,11 @@ except ImportError:
     pass
 
 # Atomik wake word (Pi5, Pi4, Pi3)
+try:
+    from modules.module_openwakeword import OpenWakeWordDetector as _OpenWakeWordDetector
+except Exception:
+    _OpenWakeWordDetector = None
+
 if CAPABILITIES is None or (CAPABILITIES.allowed_wake and "atomik" in CAPABILITIES.allowed_wake):
     try:
         from modules.module_atomik import WakeWordSystem as _WakeWordSystem
@@ -732,6 +737,10 @@ class STTManager:
                 if self.DEBUG:
                     queue_message("DEBUG: Wake word detected, starting transcription")
                 STTManager._last_status_was_sleeping = False
+                # Continuous openWakeWord+xAI already ran the turn inside the detector.
+                if getattr(self, "_continuous_turn_done", False):
+                    self._continuous_turn_done = False
+                    continue
                 # Reset sherpa VAD state to prevent heap corruption from stale native buffers
                 if self.sherpa_vad is not None:
                     self.sherpa_vad.reset()
@@ -1027,23 +1036,46 @@ class STTManager:
         except Exception as exc:
             queue_message(f"ERROR: Piper repeat failed: {exc}")
 
-    def _realtime_pcm_frames(self):
+    def _realtime_pcm_frames(self, preroll: bytes = b"", mic=None):
         """Yield 16 kHz PCM for one realtime turn. The caller closes this.
 
-        Closing the generator drops this reader. The spectrum visualizer
-        can still be holding the shared hub; playback releases that itself.
+        If ``preroll`` is set, those bytes are yielded first (continuous wake).
+        If ``mic`` is an already-open ResamplingInputStream, ownership transfers
+        here — closed in ``finally`` when listening ends, before playback.
         """
-        with ResamplingInputStream(dtype="int16") as mic:
-            try:
-                from modules.module_tts import needs_mic_flush, clear_mic_flush
-                if needs_mic_flush():
-                    mic.flush()
-                    clear_mic_flush()
-            except Exception:
-                pass
-            while True:
-                data, _overflow = mic.read(1600)
-                yield data.tobytes()
+        try:
+            if preroll:
+                step = 1600 * 2
+                for i in range(0, len(preroll), step):
+                    piece = preroll[i:i + step]
+                    if len(piece) % 2:
+                        piece = piece[:-1]
+                    if piece:
+                        yield piece
+
+            if mic is not None:
+                while True:
+                    data, _overflow = mic.read(1600)
+                    yield data.tobytes()
+                return
+
+            with ResamplingInputStream(dtype="int16") as new_mic:
+                try:
+                    from modules.module_tts import needs_mic_flush, clear_mic_flush
+                    if needs_mic_flush():
+                        new_mic.flush()
+                        clear_mic_flush()
+                except Exception:
+                    pass
+                while True:
+                    data, _overflow = new_mic.read(1600)
+                    yield data.tobytes()
+        finally:
+            if mic is not None:
+                try:
+                    mic.__exit__(None, None, None)
+                except Exception:
+                    pass
 
     def _transcribe_with_xai(self):
         """One wake is one xAI realtime turn.
@@ -1053,6 +1085,7 @@ class STTManager:
         """
         from modules.module_xai import (
             STT_REPEAT_LINE,
+            _redact_log,
             publish_turn_lines,
             run_realtime_voice_turn,
             xai_api_key,
@@ -1067,13 +1100,26 @@ class STTManager:
             return None
 
         user_name = CONFIG.get("CHAR", {}).get("user_name", "") or "User"
-        queue_message("INFO: xAI realtime voice turn")
-        frames = self._realtime_pcm_frames()
+        stt_cfg = self.config.get("STT") or {}
+        continuous = str(stt_cfg.get("wake_continuous", "False")).strip().lower() in ("1", "true", "yes", "on")
+        preroll = getattr(self, "_wake_preroll", b"") or b""
+        wake_mic = getattr(self, "_wake_mic", None)
+        # Consume one-shot handoff from the wake detector
+        self._wake_preroll = b""
+        self._wake_mic = None
+        queue_message(
+            f"INFO: xAI realtime voice turn continuous={continuous} "
+            f"preroll_ms={int(len(preroll) / 32)}"
+        )
+        frames = self._realtime_pcm_frames(preroll=preroll, mic=wake_mic)
 
         def before_play(result):
             heard = (result.get("user") or "").strip()
             said = (result.get("assistant") or "").strip()
-            queue_message("ROUND: path=xai-realtime")
+            queue_message(
+                "ROUND: path=xai-realtime "
+                f"heard={_redact_log(heard)!r} said={_redact_log(said)!r}"
+            )
             if self.ui_manager and (heard or said):
                 publish_turn_lines(
                     self.ui_manager,
@@ -1090,10 +1136,18 @@ class STTManager:
                 voice_id,
                 user_name,
                 before_play=before_play,
+                # Keep preroll: dropping wake-tail was discarding the preroll itself.
+                drop_wake_tail=not bool(preroll),
+                # Wake word inside the preroll must not start the end-of-speech timer.
+                preroll_bytes=len(preroll),
             )
         except Exception as exc:
             queue_message(f"ERROR: xAI realtime failed: {exc}")
-            self._piper_repeat(STT_REPEAT_LINE)
+            # Empty-room false wakes often open a socket on noise then idle out.
+            # Stay silent — do not ask the user to "Say that again."
+            err = str(exc).lower()
+            if "inactivity" not in err and "timed out" not in err and "timeout" not in err:
+                self._piper_repeat(STT_REPEAT_LINE)
             return None
         finally:
             frames.close()
@@ -1423,23 +1477,48 @@ class STTManager:
         processors = {
             "fastrtc": self._detect_wake_word_fastrtc,
             "sherpa-onnx": self._detect_wake_word_sherpa_onnx,
+            "openwakeword": self._detect_wake_word_openwakeword,
+            "atomik": self._detect_wake_word_atomik,
         }
         wake_proc = self.config["STT"].get("wake_word_processor", "atomik")
         return processors.get(wake_proc, self._detect_wake_word_atomik)()
 
-    def _handle_wake_detected(self):
-        """Common actions after wake word is detected: beep, notify UI, send response."""
-        # Before the acknowledgment. If the panel is already on, this only
-        # holds it on and the idle clock restarts on the next return to sleep.
+    def _handle_wake_detected(self, silent: bool = False):
+        """Common actions after wake word is detected: beep, notify UI, send response.
+
+        silent=True (continuous wake-and-talk): visual/screen only — no beep and no
+        spoken ack, so the half-duplex USB mic stays open for the command.
+        """
         try:
             from modules.module_display_power import note_wake
             note_wake()
         except Exception:
             pass
-        if self.config["STT"].get("use_indicators"):
+        stt_cfg = self.config.get("STT") or {}
+        continuous = str(stt_cfg.get("wake_continuous", "False")).strip().lower() in ("1", "true", "yes", "on")
+        silent = silent or continuous
+        if (not silent) and stt_cfg.get("use_indicators"):
             self.play_wav(os.path.join(_stt_dir(), "beep_on.wav"))
         self._fire_and_forget_get(f"http://127.0.0.1:{self._webui_port}/start_talking")
-        if self.WAKE_WORD_RESPONSES:
+        # Always wake the UI / route; only speak canned ack when not silent and not xAI.
+        try:
+            from modules.module_router import set_active_route
+            set_active_route("voice")
+        except Exception:
+            pass
+        try:
+            if self.ui_manager:
+                self.ui_manager.deactivate_screensaver()
+        except Exception:
+            pass
+        try:
+            from modules.module_state import set_tars_state, TarsState
+            set_tars_state(TarsState.LISTENING)
+        except Exception:
+            pass
+        stt_proc = str(stt_cfg.get("stt_processor", "")).strip().lower()
+        skip_ack = silent or stt_proc == "xai"
+        if self.WAKE_WORD_RESPONSES and not skip_ack:
             wake_response = random.choice(self.WAKE_WORD_RESPONSES)
             if self.wake_word_callback:
                 self.wake_word_callback(wake_response)
@@ -1511,32 +1590,129 @@ class STTManager:
 
         return False
 
+    def _detect_wake_word_openwakeword(self) -> bool:
+        """Detect wake word with openWakeWord (ONNX) and optional continuous handoff."""
+        if _OpenWakeWordDetector is None:
+            queue_message("ERROR: openWakeWord not available; pip install openwakeword (onnx)")
+            time.sleep(2)
+            return False
+
+        stt_cfg = CONFIG.get("STT", {})
+        thr = float(stt_cfg.get("openwakeword_threshold", "0.5") or 0.5)
+        confirm = int(stt_cfg.get("openwakeword_confirm_frames", "2") or 2)
+        cooldown = float(stt_cfg.get("openwakeword_cooldown_sec", "2.0") or 2.0)
+        model_rel = (stt_cfg.get("openwakeword_model") or "wakewords/TARS.onnx").strip()
+        src_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        model_path = model_rel if os.path.isabs(model_rel) else os.path.join(src_root, model_rel)
+        continuous = str(stt_cfg.get("wake_continuous", "False")).strip().lower() in ("1", "true", "yes", "on")
+        stt_proc = str(stt_cfg.get("stt_processor", "")).strip().lower()
+
+        detector = _OpenWakeWordDetector(
+            model_path=model_path,
+            threshold=thr,
+            confirm_frames=confirm,
+            cooldown=cooldown,
+            ring_seconds=2.5,
+            preroll_seconds=float(stt_cfg.get("atomik_preroll_sec", "1.2") or 1.2),
+        )
+
+        from modules.module_mic import ResamplingInputStream
+        CHUNK = 1280
+        mic = ResamplingInputStream(dtype="int16")
+        mic.__enter__()
+        handed_off = False
+        try:
+            try:
+                from modules.module_tts import needs_mic_flush, clear_mic_flush
+                if needs_mic_flush():
+                    mic.flush()
+                    clear_mic_flush()
+            except Exception:
+                pass
+            while True:
+                if not self.running or self.shutdown_event.is_set():
+                    return False
+                if is_tts_playing():
+                    time.sleep(0.05)
+                    continue
+                data, _ = mic.read(CHUNK)
+                flat = np.asarray(data, dtype=np.int16).reshape(-1)
+                accepted, score = detector.process_chunk(flat)
+                if not accepted:
+                    continue
+                preroll = detector.preroll_pcm()
+                self._wake_preroll = preroll
+                if continuous and stt_proc == "xai":
+                    self._handle_wake_detected(silent=True)
+                    # Transfer mic ownership to the realtime frame generator so
+                    # it closes before playback (half-duplex USB).
+                    self._wake_mic = mic
+                    handed_off = True
+                    STTManager._last_status_was_sleeping = False
+                    self._continuous_turn_done = True
+                    try:
+                        self._transcribe_with_xai()
+                    finally:
+                        self._wake_mic = None
+                        self._wake_preroll = b""
+                    return True
+                self._handle_wake_detected(silent=False)
+                return True
+        finally:
+            if not handed_off:
+                try:
+                    mic.__exit__(None, None, None)
+                except Exception:
+                    pass
+
     def _detect_wake_word_atomik(self) -> bool:
         sensitivity = float(CONFIG["STT"]["sensitivity"])
         norm = (sensitivity - 1) / 9
         atomik_mode = CONFIG['STT'].get('atomik_mode', 'auto').strip().lower()
         mode = None if atomik_mode == 'auto' else atomik_mode
+        stt_cfg = CONFIG.get('STT', {})
 
-        if atomik_mode == 'template':
+        # Absolute override wins when set. Otherwise map strictness slider:
+        # label says 1=lenient / 10=strict (was previously inverted in code).
+        override = (stt_cfg.get('atomik_score_threshold') or '').strip()
+        if override:
+            threshold = round(max(0.35, min(float(override), 0.95)), 2)
+        elif atomik_mode == 'template':
             # Template mode: cosine similarity scores range ~0.4-0.9
-            # Higher sensitivity = lower threshold = easier to trigger
-            # sens 1 → 0.70, sens 5 → 0.55, sens 10 → 0.40
+            # sens 1 (lenient) → 0.40, sens 10 (strict) → 0.70
             curve = norm ** 1.3
-            threshold = round(max(0.35, min(0.70 - curve * 0.35, 0.70)), 2)
+            threshold = round(max(0.35, min(0.40 + curve * 0.35, 0.70)), 2)
         else:
             # Model mode: CNN/ONNX outputs 0-1 probability
-            # sens 1 → 0.80, sens 5 → 0.68, sens 10 → 0.40
+            # sens 1 (lenient) → 0.40, sens 10 (strict) → 0.80
             curve = norm ** 1.6
-            threshold = round(max(0.40, min(0.80 - curve * 0.4, 0.80)), 2)
+            threshold = round(max(0.40, min(0.40 + curve * 0.4, 0.80)), 2)
+
+        confirm_frames = int(stt_cfg.get('atomik_confirm_frames', '2') or 2)
+        min_snr = float(stt_cfg.get('atomik_min_snr', '1.4') or 1.4)
+        cooldown = float(stt_cfg.get('atomik_cooldown_sec', '3.0') or 3.0)
 
         # Transcript verify gate
         transcript_verify_fn = None
-        stt_cfg = CONFIG.get('STT', {})
         if stt_cfg.get('vad_transcript_verify', 'False').strip() == 'True':
             transcript_verify_fn = self._build_transcript_verify_fn()
 
-        detector = WakeWordSystem(self.WAKE_WORD, self.MODEL_RATE, threshold, debug=self.DEBUG, mode=mode)
+        detector = WakeWordSystem(
+            self.WAKE_WORD, self.MODEL_RATE, threshold, debug=self.DEBUG, mode=mode,
+            confirm_frames=confirm_frames, min_snr=min_snr, cooldown=cooldown,
+        )
         detector.createModel()
+        # Configured score wins over any threshold the model loader may set.
+        if override:
+            detector.threshold = threshold
+        try:
+            detector.peak_threshold = float((stt_cfg.get('atomik_peak_threshold') or '0').strip() or 0)
+        except ValueError:
+            detector.peak_threshold = 0.0
+        queue_message(
+            f"INFO: Atomik wake thr={detector.threshold:.2f} peak>={detector.peak_threshold:.2f} confirm={confirm_frames} "
+            f"contrast>={detector._min_contrast:.2f} min_snr={min_snr:.2f} cooldown={cooldown:.1f}s"
+        )
         # Wait for TTS to finish before entering blocking wake word listener
         waited = 0.0
         while is_tts_playing() and waited < 3.0:
@@ -1551,6 +1727,30 @@ class STTManager:
             detector.listenForWakeWord()
             audio_window = np.array(list(detector.buffer)[-int(self.MODEL_RATE * 2):], dtype=np.float32)
             if self._run_wake_gates(audio_window, transcript_verify_fn=transcript_verify_fn):
+                stt_cfg = CONFIG.get("STT", {})
+                continuous = str(stt_cfg.get("wake_continuous", "False")).strip().lower() in ("1", "true", "yes", "on")
+                stt_proc = str(stt_cfg.get("stt_processor", "")).strip().lower()
+                # Build preroll from Atomik float buffer ([-1,1] ~ float32 PCM).
+                # Stream already closed; preroll recovers command across mic-reopen gap.
+                try:
+                    preroll_sec = float(stt_cfg.get("atomik_preroll_sec", "1.2") or 1.2)
+                    preroll_sec = max(0.3, min(preroll_sec, 2.5))
+                    buf = np.array(list(detector.buffer), dtype=np.float32)
+                    n = min(len(buf), int(self.MODEL_RATE * preroll_sec))
+                    if n > 0:
+                        clip = np.clip(buf[-n:] * 32767.0, -32768, 32767).astype(np.int16)
+                        self._wake_preroll = clip.tobytes()
+                except Exception:
+                    self._wake_preroll = b""
+                if continuous and stt_proc == "xai":
+                    self._handle_wake_detected(silent=True)
+                    STTManager._last_status_was_sleeping = False
+                    self._continuous_turn_done = True
+                    try:
+                        self._transcribe_with_xai()
+                    finally:
+                        self._wake_preroll = b""
+                    return True
                 self._handle_wake_detected()
                 return True
 

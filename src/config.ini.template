@@ -113,6 +113,27 @@ speaker_id_threshold = 0.75
 mic_amp_gain = 13.0
 # Silence margin — how many times above background noise counts as speech (lower = more sensitive, default 2.0)
 silence_margin = 2.0
+# Atomik score/peak are absolute. Empty is not used; these are the tuned defaults.
+# confirm_frames is consecutive frames above the score. min_snr is logged; the
+# live gate is frame contrast (see module_atomik).
+atomik_score_threshold = 0.50
+atomik_peak_threshold = 0.60
+atomik_confirm_frames = 2
+atomik_min_snr = 1.4
+atomik_cooldown_sec = 3.0
+# Seconds of audio kept from the wake and passed into the realtime turn.
+atomik_preroll_sec = 1.2
+# When True, a wake keeps the mic open and skips the beep so the command is not lost.
+wake_continuous = False
+# Optional openWakeWord engine. Model files are downloaded into src/wakewords/ (not in git).
+openwakeword_threshold = 0.5
+openwakeword_confirm_frames = 2
+openwakeword_cooldown_sec = 2.0
+openwakeword_model = wakewords/TARS.onnx
+# How long a voice conversation stays in context between wakes, in seconds.
+session_ttl_sec = 300
+# Write each realtime turn to /tmp for level checks. Leave off.
+debug_save_turn_audio = False
 
 [TTS]
 # Use voice settings from character card instead of settings above
@@ -120,6 +141,22 @@ toggle_charvoice = True
 # TTS engine: xai | espeak | piper | silero | elevenlabs | openai | other | external
 # xai speaks replies. piper remains the outage voice when xAI is down.
 ttsoption = xai
+# Realtime reply speed, clamped to 0.7–1.5.
+voice_speed = 1.10
+# Room effect on both playback paths (sox). Off only when this is False.
+voice_fx = True
+voice_fx_preset = tars_movie
+voice_fx_reverberance = 42
+voice_fx_hf_damping = 50
+voice_fx_room_scale = 58
+voice_fx_predelay_ms = 20
+voice_fx_wet_db = -4
+voice_fx_echo1_ms = 80
+voice_fx_echo1_decay = 0.12
+voice_fx_echo2_ms = 0
+voice_fx_echo2_decay = 0
+voice_fx_tail_ms = 400
+voice_fx_tempo = 1.0
 # External TTS server URL (ttsoption = other or external)
 ttsurl = 
 # Voice name/ID for external TTS server

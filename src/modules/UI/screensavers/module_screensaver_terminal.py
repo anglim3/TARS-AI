@@ -306,11 +306,6 @@ class TerminalAnimation:
                 self.screen.blit(text_surface, (x_offset, y))
                 x_offset += text_surface.get_width()
             
-            if i == len(self.lines) - 1 and not line['completed']:
-                cursor_x = x_offset + 2
-                if (self.blink_counter // 15) % 2 == 0:
-                    cursor_color = (0, 255, 255)
-                    pygame.draw.rect(self.screen, cursor_color, (cursor_x, y, 8, self.line_height - 2))
         
         if self.show_time and self.time_overlay:
             self.time_overlay.render(self.screen)

@@ -61,7 +61,7 @@ DEVICE_PROFILES: Dict[DeviceProfile, DeviceCapabilities] = {
         allowed_stt={"fastrtc", "silero", "openai", "external", "sherpa-onnx", "xai"},
         allowed_tts={"espeak", "piper", "silero", "elevenlabs", "openai", "other", "external", "xai"},
         allowed_vad={"silero", "rms", "sherpa-onnx", "smart-turn"},
-        allowed_wake={"fastrtc", "atomik", "sherpa-onnx"},
+        allowed_wake={"fastrtc", "atomik", "sherpa-onnx", "openwakeword"},
         can_use_embeddings=True,
         can_use_ui=True,
         can_use_vision=True,
@@ -79,7 +79,7 @@ DEVICE_PROFILES: Dict[DeviceProfile, DeviceCapabilities] = {
         allowed_stt={"openai", "external", "sherpa-onnx", "xai"},
         allowed_tts={"espeak", "piper", "elevenlabs", "openai", "other", "external", "xai"},
         allowed_vad={"silero", "rms", "sherpa-onnx", "smart-turn"},
-        allowed_wake={"atomik", "sherpa-onnx"},
+        allowed_wake={"atomik", "sherpa-onnx", "openwakeword"},
         can_use_embeddings=True,
         can_use_ui=True,
         can_use_vision=False,
@@ -97,7 +97,7 @@ DEVICE_PROFILES: Dict[DeviceProfile, DeviceCapabilities] = {
         allowed_stt={"openai", "external", "xai"},
         allowed_tts={"espeak", "elevenlabs", "openai", "other", "external", "xai"},
         allowed_vad={"rms", "sherpa-onnx"},
-        allowed_wake={"atomik", "sherpa-onnx"},
+        allowed_wake={"atomik", "sherpa-onnx", "openwakeword"},
         can_use_embeddings=False,
         can_use_ui=True,
         can_use_vision=False,
@@ -261,6 +261,20 @@ class TTSConfig:
     piper_speaker_sadness: int = 5
     piper_speaker_surprise: int = 6
     piper_speaker_anger: int = 7
+    voice_speed: float = 1.10
+    voice_fx: bool = True
+    voice_fx_preset: str = "tars_movie"
+    voice_fx_reverberance: float = 42
+    voice_fx_hf_damping: float = 50
+    voice_fx_room_scale: float = 58
+    voice_fx_predelay_ms: float = 20
+    voice_fx_wet_db: float = -4
+    voice_fx_echo1_ms: float = 80
+    voice_fx_echo1_decay: float = 0.12
+    voice_fx_echo2_ms: float = 0
+    voice_fx_echo2_decay: float = 0
+    voice_fx_tail_ms: float = 400
+    voice_fx_tempo: float = 1.0
 
     def __getitem__(self, key):
         return getattr(self, key)
@@ -299,6 +313,20 @@ class TTSConfig:
             piper_speaker_sadness=config_dict.get('piper_speaker_sadness', 5),
             piper_speaker_surprise=config_dict.get('piper_speaker_surprise', 6),
             piper_speaker_anger=config_dict.get('piper_speaker_anger', 7),
+            voice_speed=config_dict.get('voice_speed', 1.10),
+            voice_fx=config_dict.get('voice_fx', True),
+            voice_fx_preset=config_dict.get('voice_fx_preset', 'tars_movie'),
+            voice_fx_reverberance=config_dict.get('voice_fx_reverberance', 42),
+            voice_fx_hf_damping=config_dict.get('voice_fx_hf_damping', 50),
+            voice_fx_room_scale=config_dict.get('voice_fx_room_scale', 58),
+            voice_fx_predelay_ms=config_dict.get('voice_fx_predelay_ms', 20),
+            voice_fx_wet_db=config_dict.get('voice_fx_wet_db', -4),
+            voice_fx_echo1_ms=config_dict.get('voice_fx_echo1_ms', 80),
+            voice_fx_echo1_decay=config_dict.get('voice_fx_echo1_decay', 0.12),
+            voice_fx_echo2_ms=config_dict.get('voice_fx_echo2_ms', 0),
+            voice_fx_echo2_decay=config_dict.get('voice_fx_echo2_decay', 0),
+            voice_fx_tail_ms=config_dict.get('voice_fx_tail_ms', 400),
+            voice_fx_tempo=config_dict.get('voice_fx_tempo', 1.0),
         )
 
 
@@ -403,8 +431,22 @@ def load_config():
             "sherpa_onnx_punctuation": config.get('STT', 'sherpa_onnx_punctuation', fallback='False'),
             "wake_word": config['STT']['wake_word'],
             "wake_word_processor": config['STT']['wake_word_processor'],
+            "openwakeword_threshold": config.get('STT', 'openwakeword_threshold', fallback='0.5'),
+            "openwakeword_confirm_frames": config.get('STT', 'openwakeword_confirm_frames', fallback='2'),
+            "openwakeword_cooldown_sec": config.get('STT', 'openwakeword_cooldown_sec', fallback='2.0'),
+            "openwakeword_model": config.get('STT', 'openwakeword_model', fallback='wakewords/TARS.onnx'),
+            "wake_continuous": config.get('STT', 'wake_continuous', fallback='False'),
+
             "atomik_mode": config.get('STT', 'atomik_mode', fallback='auto'),
             "sensitivity": config['STT']['sensitivity'],
+            "atomik_score_threshold": config.get('STT', 'atomik_score_threshold', fallback='0.50'),
+            "atomik_confirm_frames": config.get('STT', 'atomik_confirm_frames', fallback='2'),
+            "atomik_min_snr": config.get('STT', 'atomik_min_snr', fallback='1.4'),
+            "atomik_cooldown_sec": config.get('STT', 'atomik_cooldown_sec', fallback='3.0'),
+            "atomik_peak_threshold": config.get('STT', 'atomik_peak_threshold', fallback='0.60'),
+            "atomik_preroll_sec": config.get('STT', 'atomik_preroll_sec', fallback='1.2'),
+            "debug_save_turn_audio": config.get('STT', 'debug_save_turn_audio', fallback='False'),
+            "session_ttl_sec": config.get('STT', 'session_ttl_sec', fallback='300'),
             "vad_transcript_verify": config.get('STT', 'vad_transcript_verify', fallback='False'),
             "vad_presence_gate": config.get('STT', 'vad_presence_gate', fallback='off'),
             "vad_speaker_verify": config.get('STT', 'vad_speaker_verify', fallback='off'),
@@ -485,6 +527,20 @@ def load_config():
             "piper_speaker_sadness": config.getint('TTS', 'piper_speaker_sadness', fallback=5),
             "piper_speaker_surprise": config.getint('TTS', 'piper_speaker_surprise', fallback=6),
             "piper_speaker_anger": config.getint('TTS', 'piper_speaker_anger', fallback=7),
+            "voice_speed": config.getfloat('TTS', 'voice_speed', fallback=1.10),
+            "voice_fx": config.getboolean('TTS', 'voice_fx', fallback=True),
+            "voice_fx_preset": config.get('TTS', 'voice_fx_preset', fallback='tars_movie'),
+            "voice_fx_reverberance": config.getfloat('TTS', 'voice_fx_reverberance', fallback=42),
+            "voice_fx_hf_damping": config.getfloat('TTS', 'voice_fx_hf_damping', fallback=50),
+            "voice_fx_room_scale": config.getfloat('TTS', 'voice_fx_room_scale', fallback=58),
+            "voice_fx_predelay_ms": config.getfloat('TTS', 'voice_fx_predelay_ms', fallback=20),
+            "voice_fx_wet_db": config.getfloat('TTS', 'voice_fx_wet_db', fallback=-4),
+            "voice_fx_echo1_ms": config.getfloat('TTS', 'voice_fx_echo1_ms', fallback=80),
+            "voice_fx_echo1_decay": config.getfloat('TTS', 'voice_fx_echo1_decay', fallback=0.12),
+            "voice_fx_echo2_ms": config.getfloat('TTS', 'voice_fx_echo2_ms', fallback=0),
+            "voice_fx_echo2_decay": config.getfloat('TTS', 'voice_fx_echo2_decay', fallback=0),
+            "voice_fx_tail_ms": config.getfloat('TTS', 'voice_fx_tail_ms', fallback=400),
+            "voice_fx_tempo": config.getfloat('TTS', 'voice_fx_tempo', fallback=1.0),
         }),
         "RAG": {
             "enabled": config.getboolean('RAG', 'enabled', fallback=True),
@@ -771,7 +827,7 @@ CONFIG_METADATA = {
         'wake_word_processor': {
             'group': 'wake_word',
             'label': 'Wake Word Engine',
-            'options': ['atomik', 'fastrtc', 'sherpa-onnx'],
+            'options': ['atomik', 'fastrtc', 'sherpa-onnx', 'openwakeword'],
             'description': '"atomik" is built into TARS, works offline, and is the recommended choice. "sherpa-onnx" transcribes audio and matches the wake word offline (Pi5/Pi4). "fastrtc" uses an internet-based service for detection.'
         },
         'atomik_mode': {
