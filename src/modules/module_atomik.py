@@ -418,6 +418,17 @@ class OnnxWakeWordModel:
         return float(result[0][0][0])
 
 
+def wake_status_line(kind, score=0.0, detail=""):
+    """Lines worth keeping from the wake loop. Idle metering returns nothing."""
+    if kind == "hit":
+        return f"INFO: wake hit score={float(score):.3f}"
+    if kind == "reopen":
+        return str(detail)
+    if kind == "error":
+        return f"ERROR: wake listen failed: {detail}"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Wake word system — CNN-based
 # ---------------------------------------------------------------------------
@@ -441,7 +452,9 @@ class WakeWordSystem:
         self.augment_data = augment_data
         self.debug = debug or self.DEBUG_DETECTION
         self.mfcc_extractor = MFCCExtractor(sample_rate=sample_rate)
-        self.vad = VoiceActivityDetector(sample_rate=sample_rate)
+        # USB mic: a short wake phrase averages ~0.007 over 1s while
+        # chunks peak ~0.02. The old 0.008 gate returned before ONNX.
+        self.vad = VoiceActivityDetector(sample_rate=sample_rate, energy_threshold=0.003)
         self.buffer = deque(maxlen=sample_rate * 3)
         self.model = None  # OnnxWakeWordModel (model mode) or None (template mode)
         self._using_onnx = False
@@ -456,9 +469,19 @@ class WakeWordSystem:
         self._last_debug_time = 0
         self._peak_score_since_debug = 0.0
         # Adaptive noise floor — tracks background noise level for SNR gating
-        self._noise_floor = 0.005  # initial estimate
+        self._noise_floor_init = 0.005
+        self._noise_floor = self._noise_floor_init
         self._noise_alpha = 0.02   # slow adaptation rate
-        self._min_snr = 3.0        # minimum signal-to-noise ratio to consider
+        # A one-second mean sits next to the noise floor even while someone
+        # is talking, so a ratio on that mean rejects the phrase. Speech
+        # modulates: loud 50 ms frames are about twice the quiet ones.
+        # Steady room noise stays near 1.1–1.5. The model threshold is
+        # unchanged; this only decides whether the model gets to run.
+        self._min_contrast = 1.75
+        self._gate_reject = None
+        # While this is in the future, quiet frames must not raise the floor.
+        # listenForWakeWord sets it so playback tail cannot poison SNR.
+        self._floor_freeze_until = 0.0
         # Template mode (original cosine similarity)
         self.templates = []
         # Mode: auto-detect if not specified
@@ -715,25 +738,145 @@ class WakeWordSystem:
 
     # --- Detection ---
 
+    def reset_listen_state(self):
+        """Forget the previous turn before listening again.
+
+        The noise floor ratchets up on the tail of playback and then the
+        SNR gate rejects speech. Recent scores and the cooldown are cleared
+        so that turn cannot suppress the next one. Floor updates stay frozen
+        for 1.5s so the tail itself cannot climb the new floor.
+        """
+        self._noise_floor = self._noise_floor_init
+        self._recent_scores.clear()
+        self.last_detection_time = 0
+        self.last_check_time = 0
+        self._peak_score_since_debug = 0.0
+        self._gate_reject = None
+        self._floor_freeze_until = time.monotonic() + 1.5
+
     def listenForWakeWord(self):
         detected_flag = False
+        self.reset_listen_state()
+        heard = {"n": 0}
+        # audible_at stays put while every chunk is near digital silence.
+        audible_at = {"t": time.monotonic()}
+        window = {"peak_score": 0.0}
 
         def audio_callback(audio_np, frames, time_info, status):
             nonlocal detected_flag
-            self.buffer.extend(audio_np)
+            heard["n"] += 1
+            audio = np.asarray(audio_np, dtype=np.float32).reshape(-1)
+            if audio.size:
+                rms = float(np.sqrt(np.mean(np.square(audio))))
+                if rms >= 1e-4:
+                    audible_at["t"] = time.monotonic()
+            self.buffer.extend(audio)
 
             detected, confidence = self.detect()
+            if confidence > window["peak_score"]:
+                window["peak_score"] = float(confidence)
             if detected:
                 detected_flag = True
 
-        with open_native_stream(callback=make_resampling_callback(audio_callback),
-                                blocksize=512):
-            while not detected_flag:
-                time.sleep(0.05)
+        self.buffer.clear()
+        from modules.module_mic import _hub, clear_device_cache
+        from modules.module_messageQue import queue_message
+        if not _hub.input_open:
+            _hub.reopen_input()
+
+        def reopen_once(why):
+            queue_message(why)
+            clear_device_cache()
+            _hub.reopen_input()
+            self.buffer.clear()
+            self.reset_listen_state()
+            audible_at["t"] = time.monotonic()
+            window["peak_score"] = 0.0
+
+        while not detected_flag:
+            try:
+                with open_native_stream(callback=make_resampling_callback(audio_callback),
+                                        blocksize=512):
+                    started = time.monotonic()
+                    reopened = False
+                    while not detected_flag:
+                        time.sleep(0.05)
+                        now = time.monotonic()
+                        if not reopened and now - started > 1.5:
+                            if heard["n"] == 0:
+                                reopen_once("INFO: wake mic went quiet, reopening it")
+                                reopened = True
+                                started = time.monotonic()
+                            elif now - audible_at["t"] > 1.5:
+                                reopen_once("INFO: wake stream near-silent, reopening input")
+                                reopened = True
+                                started = time.monotonic()
+            except Exception as exc:
+                queue_message(f"ERROR: wake listen failed: {exc}")
+                time.sleep(1.0)
+        queue_message(wake_status_line("hit", score=window["peak_score"]))
         return True
+
+    def _frame_levels(self, audio):
+        """Quiet and loud 50 ms levels inside one window."""
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        frame = max(1, int(self.sample_rate * 0.05))
+        count = len(audio) // frame
+        if count < 4:
+            rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+            return rms, rms
+        frames = audio[:count * frame].reshape(count, frame)
+        levels = np.sqrt(np.mean(np.square(frames), axis=1))
+        return float(np.percentile(levels, 10)), float(np.percentile(levels, 90))
+
+    def _listen_gate(self, audio_window):
+        """Reject silence, steady noise, bangs, and non-speech spectra.
+
+        Returns a reason, or None when the window may reach the model.
+        The SNR check uses frame contrast, not the one-second mean. A short
+        phrase averages down into the noise floor and was rejected as snr
+        before the model scored it.
+        """
+        audio_window = np.asarray(audio_window, dtype=np.float32).reshape(-1)
+        if audio_window.size == 0:
+            return "energy"
+        quiet, loud = self._frame_levels(audio_window)
+        mean_rms = float(np.sqrt(np.mean(np.square(audio_window))))
+        self._last_gate_rms = mean_rms
+        contrast = loud / (quiet + 1e-8)
+        if time.monotonic() >= self._floor_freeze_until:
+            # Steady noise may follow the room. Speech only pulls the floor down.
+            if contrast < self._min_contrast:
+                self._noise_floor = (
+                    (1 - self._noise_alpha) * self._noise_floor
+                    + self._noise_alpha * max(quiet, 0.0)
+                )
+            elif quiet < self._noise_floor:
+                self._noise_floor = (
+                    (1 - self._noise_alpha) * self._noise_floor
+                    + self._noise_alpha * quiet
+                )
+        if loud < self.vad.energy_threshold:
+            return "energy"
+        if contrast < self._min_contrast:
+            return "snr"
+        peak = float(np.max(np.abs(audio_window)))
+        if peak / (mean_rms + 1e-8) > 15:
+            return "crest"
+        fft_mag = np.abs(np.fft.rfft(audio_window))
+        freqs = np.fft.rfftfreq(len(audio_window), 1.0 / self.sample_rate)
+        total_band = np.sum(fft_mag) + 1e-8
+        speech_band = np.sum(fft_mag[(freqs >= 300) & (freqs <= 3000)])
+        if speech_band / total_band < 0.30:
+            return "spectral"
+        low_band = np.sum(fft_mag[freqs < 300])
+        if low_band / total_band > 0.60:
+            return "spectral"
+        return None
 
     def detect(self):
         # Template mode uses simpler detection path
+        self._gate_reject = None
         if self._mode == self.MODE_TEMPLATE:
             return self._detect_template()
 
@@ -746,40 +889,9 @@ class WakeWordSystem:
         self.last_check_time = time.time()
 
         audio_window = np.array(list(self.buffer)[-int(self.sample_rate):], dtype=np.float32)
-
-        # --- Gate 1: Energy gate ---
-        rms = np.sqrt(np.mean(audio_window ** 2))
-        if rms < self.vad.energy_threshold:
-            # Update noise floor from quiet frames
-            self._noise_floor = (1 - self._noise_alpha) * self._noise_floor + self._noise_alpha * rms
-            return False, 0.0
-
-        # --- Gate 2: Adaptive SNR gate ---
-        snr = rms / (self._noise_floor + 1e-8)
-        if snr < self._min_snr:
-            return False, 0.0
-
-        # --- Gate 3: Crest factor — reject transient bangs/clicks ---
-        # Bangs have very high peak relative to RMS. Speech is more uniform.
-        peak = np.max(np.abs(audio_window))
-        crest = peak / (rms + 1e-8)
-        if crest > 15:  # bangs/clicks typically > 15, speech < 10
-            return False, 0.0
-
-        # --- Gate 4: Spectral speech gate ---
-        # Speech concentrates energy in 300-3000Hz. Noise/bangs are broadband.
-        fft_mag = np.abs(np.fft.rfft(audio_window))
-        freqs = np.fft.rfftfreq(len(audio_window), 1.0 / self.sample_rate)
-        speech_band = np.sum(fft_mag[(freqs >= 300) & (freqs <= 3000)])
-        total_band = np.sum(fft_mag) + 1e-8
-        speech_ratio = speech_band / total_band
-        if speech_ratio < 0.30:
-            return False, 0.0
-
-        # --- Gate 5: Sub-300Hz ratio — reject low rumbles/thuds ---
-        low_band = np.sum(fft_mag[freqs < 300])
-        low_ratio = low_band / total_band
-        if low_ratio > 0.60:  # rumbles/thuds have >60% energy below 300Hz
+        reason = self._listen_gate(audio_window)
+        if reason:
+            self._gate_reject = reason
             return False, 0.0
 
         # Extract features
@@ -818,6 +930,7 @@ class WakeWordSystem:
 
         if above_count >= self._confirmation_count:
             if not self._is_speech_like(audio_window):
+                self._gate_reject = "speechlike"
                 if self.debug:
                     print(f"\r  [atomik] rejected: not speech-like                                    ", flush=True)
                 self._recent_scores.clear()

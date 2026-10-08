@@ -35,6 +35,19 @@ except ImportError:
 
 MODEL_RATE = 16000
 
+
+def quiet_get(url, get, timeout=1.0):
+    """Fire a local UI GET. Nothing listening must not print a traceback."""
+    def _run():
+        try:
+            get(url, timeout=timeout)
+        except Exception:
+            return
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return thread
+
 # ── Singleton device info ──────────────────────────────────────────
 
 _device_info = None  # cached (device_idx, native_rate)
@@ -117,6 +130,13 @@ def get_device_info(retries=4, backoff=1.0):
                 print(f"WARNING: Could not detect mic after {retries} attempts ({e}), using defaults")
                 _device_info = (None, MODEL_RATE)
     return _device_info
+
+
+def clear_device_cache():
+    """Drop the cached input device so the next open queries PortAudio again."""
+    global _device_info
+    with _device_lock:
+        _device_info = None
 
 
 def get_native_rate():
@@ -329,6 +349,25 @@ class _AudioHub:
                     self._ensure_stream()
                 except Exception:
                     pass
+
+    def reopen_input(self):
+        """Close the input and open it again. Registered consumers stay.
+
+        After aplay, PortAudio has been torn down. The stream opened in
+        that window can look fine and still never deliver samples.
+        """
+        with self._lock:
+            self._paused = False
+            stream = self._take_stream_locked()
+        self._stop_stream(stream)
+        clear_device_cache()
+        with self._lock:
+            try:
+                self._ensure_stream()
+            except Exception:
+                self._stream = None
+                return False
+            return self._stream is not None
 
     @property
     def input_open(self):
@@ -762,7 +801,15 @@ def play_pcm_half_duplex(
             init()
         except Exception:
             pass
+        clear_device_cache()
+        time.sleep(0.2)
         try:
             hub.resume()
         except Exception:
             pass
+        if not hub.input_open:
+            time.sleep(0.3)
+            try:
+                hub.reopen_input()
+            except Exception:
+                pass

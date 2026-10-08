@@ -298,6 +298,7 @@ class _StuckHub:
 class RealtimeTurnTests(unittest.TestCase):
     def test_floor_only_falls(self):
         gate = xai.FallingNoiseFloor()
+        self.assertEqual(gate.margin, 2.0)
         self.assertFalse(gate.is_speech(100.0))
         self.assertTrue(gate.is_speech(2000.0))
         self.assertLessEqual(gate.floor, 100.0)
@@ -514,14 +515,15 @@ class RealtimeTurnTests(unittest.TestCase):
         instructions = session["session"]["instructions"]
         self.assertIn("TARS", instructions)
         self.assertIn("how can I help", instructions)
-        self.assertIn("deadpan", instructions)
+        self.assertIn("military-surplus", instructions)
+        self.assertIn("every light", instructions)
         names = [item["name"] for item in session["session"]["tools"]]
         self.assertIn("calendar_agenda", names)
         self.assertIn("calendar_create", names)
         self.assertIn("tasks_list", names)
         self.assertIn("tasks_add", names)
         self.assertIn("tasks_complete", names)
-        self.assertNotIn("home", names)
+        self.assertIn("home", names)
         sent_types = [
             json.loads(item).get("type")
             for item in socket.sent
@@ -622,11 +624,153 @@ class RealtimeTurnTests(unittest.TestCase):
             play_pcm=lambda _pcm: (_ for _ in ()).throw(AssertionError("played")),
         ))
 
-    def test_home_tool_is_not_available_on_the_realtime_socket(self):
+    def test_home_tool_runs_on_the_realtime_socket(self):
+        for name in ("HA_TOKEN", "HA_URL"):
+            os.environ.pop(name, None)
+        self.assertIn("home", xai.REALTIME_TOOL_NAMES)
         self.assertEqual(
             xai.execute_household_tool("home", {"text": "turn off the lights"}),
-            "That tool is not available.",
+            "Home Assistant is not configured.",
         )
+
+    def test_realtime_gate_reads_silence_margin_two(self):
+        # 250 clears a floor of 100 at margin 2.0 and misses it at 3.0.
+        chunks = [_tone(250)] * 3 + [_tone(100)] + [_tone(250)] * 4 + [_tone(100)] * 15
+        source = PcmSource(chunks)
+        _kept, reason = xai.read_until_turn_end(lambda: next(source))
+        self.assertEqual(reason, "silence")
+        self.assertEqual(source.index, 3 + 1 + 4 + 10)
+
+    def test_instructions_do_not_hardcode_device_names(self):
+        class _Roster:
+            def device_roster(self):
+                return "Known devices: Ceiling (light, off); Fan (switch, on)."
+
+        old = xai._household_tools_module
+        xai._household_tools_module = lambda: _Roster()
+        try:
+            text = xai.realtime_instructions("Ada")
+        finally:
+            xai._household_tools_module = old
+        self.assertIn("Ceiling", text)
+        self.assertIn("Fan", text)
+        self.assertIn("every light", text)
+        self.assertIn("A named device is controlled alone", text)
+        self.assertNotIn("Dimmer", text)
+        self.assertNotIn("Outlet", text)
+
+    def test_home_tool_logs_the_phrase_and_the_sentence(self):
+        os.environ["HA_TOKEN"] = "super-secret-token"
+        os.environ["HA_URL"] = "http://ha.local:8123"
+        logged = []
+        old_queue = xai.queue_message
+        old_exec = xai.execute_household_tool
+        xai.queue_message = logged.append
+        xai.execute_household_tool = lambda name, arguments, module=None: (
+            "Turned the lights on. super-secret-token http://ha.local:8123?token=abc"
+        )
+        try:
+            said = xai.default_realtime_tool("home", {
+                "text": "turn the lights on http://ha.local:8123?token=abc",
+            })
+        finally:
+            xai.queue_message = old_queue
+            xai.execute_household_tool = old_exec
+        self.assertEqual(said, "Turned the lights on. super-secret-token http://ha.local:8123?token=abc")
+        self.assertTrue(logged)
+        line = logged[-1]
+        self.assertIn("INFO: xAI realtime tool home", line)
+        self.assertIn("phrase=turn the lights on", line)
+        self.assertIn("said=Turned the lights on.", line)
+        self.assertNotIn("super-secret-token", line)
+        self.assertNotIn("ha.local", line)
+        self.assertNotIn("token=abc", line)
+
+
+def _band_speech(scale=0.0055, seed=0):
+    """A short phrase in the speech band whose one-second mean sits on the floor."""
+    sr = 16000
+    n = sr
+    rng = np.random.default_rng(seed)
+    t = np.arange(n) / sr
+    env = np.zeros(n)
+    for center in (0.62, 0.84):
+        env += np.exp(-0.5 * ((t - center) / 0.07) ** 2)
+    env = 0.15 + 0.85 * (env / (env.max() + 1e-12))
+    spec = np.fft.rfft(rng.normal(0, 1, n) * env)
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    spec[(freqs < 300) | (freqs > 3000)] = 0
+    audio = np.fft.irfft(spec, n=n).astype(np.float32)
+    audio *= scale / (float(np.sqrt(np.mean(np.square(audio)))) + 1e-12)
+    return audio
+
+
+def _pink(level=0.01, seed=1):
+    n = 16000
+    rng = np.random.default_rng(seed)
+    white = rng.normal(0, 1, n)
+    acc = 0.0
+    out = np.empty(n, dtype=np.float64)
+    for i, sample in enumerate(white):
+        acc = 0.97 * acc + 0.03 * sample
+        out[i] = acc
+    out = out / (np.sqrt(np.mean(out ** 2)) + 1e-12) * level
+    return out.astype(np.float32)
+
+
+class WakeGateTests(unittest.TestCase):
+    def test_phrase_near_the_floor_is_not_an_snr_reject(self):
+        import modules.module_atomik as atomik
+
+        system = atomik.WakeWordSystem(threshold=0.65)
+        audio = _band_speech()
+        mean = float(np.sqrt(np.mean(np.square(audio))))
+        self.assertLess(mean / system._noise_floor, 1.15)
+        self.assertIsNone(system._listen_gate(audio))
+        self.assertIsNone(system._listen_gate(audio))
+        self.assertEqual(system.threshold, 0.65)
+
+    def test_steady_room_noise_is_snr(self):
+        import modules.module_atomik as atomik
+
+        system = atomik.WakeWordSystem(threshold=0.65)
+        self.assertEqual(system._listen_gate(_pink()), "snr")
+        click = np.zeros(16000, dtype=np.float32)
+        click[8000] = 1.0
+        self.assertIsNotNone(system._listen_gate(click))
+
+    def test_wake_log_keeps_hit_and_drops_idle(self):
+        import modules.module_atomik as atomik
+
+        self.assertIsNone(atomik.wake_status_line("idle"))
+        self.assertIsNone(atomik.wake_status_line("rms"))
+        self.assertEqual(atomik.wake_status_line("hit", score=0.812), "INFO: wake hit score=0.812")
+        self.assertEqual(
+            atomik.wake_status_line("reopen", detail="INFO: wake mic went quiet, reopening it"),
+            "INFO: wake mic went quiet, reopening it",
+        )
+        self.assertIn("ERROR", atomik.wake_status_line("error", detail="port"))
+
+    def test_face_server_get_fails_quietly(self):
+        import modules.module_mic as mic
+
+        errors = []
+        old = threading.excepthook
+        threading.excepthook = lambda args: errors.append(args)
+        seen = []
+
+        def boom(url, timeout=1):
+            seen.append(url)
+            raise ConnectionError("connection refused")
+
+        try:
+            thread = mic.quiet_get("http://127.0.0.1:80/start_talking", boom)
+            thread.join(timeout=1)
+        finally:
+            threading.excepthook = old
+        self.assertEqual(seen, ["http://127.0.0.1:80/start_talking"])
+        self.assertEqual(errors, [])
+        self.assertFalse(thread.is_alive())
 
 
 if __name__ == "__main__":

@@ -344,6 +344,7 @@ TURN_NO_SPEECH_SECONDS = 6.0
 TURN_CAP_SECONDS = 12.0
 USER_TRANSCRIPT_GRACE = 2.5
 REALTIME_TOOL_NAMES = (
+    "home",
     "calendar_agenda",
     "calendar_create",
     "tasks_list",
@@ -357,6 +358,8 @@ HOUSEHOLD_ENV_NAMES = (
     "GOOGLE_OAUTH_REFRESH_TOKEN",
     "CALENDAR_ID",
     "CALENDAR_TIMEZONE",
+    "HA_URL",
+    "HA_TOKEN",
 )
 
 
@@ -381,7 +384,7 @@ class FallingNoiseFloor:
     above real speech because of the microphone amp gain.
     """
 
-    def __init__(self, margin=3.0, gap=50.0):
+    def __init__(self, margin=2.0, gap=50.0):
         self.margin = margin
         self.gap = gap
         self.floor = None
@@ -431,7 +434,7 @@ def read_until_turn_end(read_chunk, on_chunk=None, sample_rate=REALTIME_SAMPLE_R
         dropped = tail_bytes
         break
 
-    gate = FallingNoiseFloor()
+    gate = FallingNoiseFloor(margin=2.0)
     kept = []
     total = 0
     quiet = 0
@@ -594,7 +597,7 @@ def _household_tools_module():
 
 
 def realtime_function_tools(module=None):
-    """Function tools the realtime model may call. Home Assistant is omitted."""
+    """Function tools the realtime model may call, including Home Assistant."""
     module = module or _household_tools_module()
     by_name = {item["name"]: item for item in getattr(module, "TOOLS", [])}
     tools = []
@@ -612,7 +615,7 @@ def realtime_function_tools(module=None):
 
 
 def execute_household_tool(name, arguments, module=None):
-    """Run one household handler. Unknown names and Home Assistant do not run."""
+    """Run one household handler. Unknown names do not run."""
     if name not in REALTIME_TOOL_NAMES:
         return "That tool is not available."
     module = module or _household_tools_module()
@@ -622,6 +625,7 @@ def execute_household_tool(name, arguments, module=None):
         "tasks_list": module.tasks_list,
         "tasks_add": module.tasks_add,
         "tasks_complete": module.tasks_complete,
+        "home": module.home,
     }
     handler = handlers.get(name)
     if handler is None:
@@ -639,26 +643,97 @@ def execute_household_tool(name, arguments, module=None):
         return "The tool failed."
 
 
+_LOG_SECRET_NAMES = (
+    "HA_TOKEN",
+    "HA_URL",
+    "XAI_API_KEY",
+    "HERMES_API_KEY",
+    "TODOIST_API_TOKEN",
+    "GOOGLE_OAUTH_CLIENT_ID",
+    "GOOGLE_OAUTH_CLIENT_SECRET",
+    "GOOGLE_OAUTH_REFRESH_TOKEN",
+)
+
+
+def _redact_log(text):
+    """One log line. Secrets and URLs that carry them are not included."""
+    import re
+
+    cleaned = " ".join(str(text or "").split())
+
+    def _scrub(match):
+        url = match.group(0)
+        tail = url.split("://", 1)[-1]
+        if "@" in tail or "?" in url:
+            return "[redacted-url]"
+        return url
+
+    cleaned = re.sub(r"https?://\S+", _scrub, cleaned)
+    for name in _LOG_SECRET_NAMES:
+        secret = (os.environ.get(name) or "").strip()
+        if secret and secret in cleaned:
+            cleaned = cleaned.replace(secret, "[redacted]")
+    return cleaned
+
+
+def _tool_phrase(arguments):
+    payload = arguments
+    if isinstance(arguments, str):
+        try:
+            payload = json.loads(arguments or "{}")
+        except json.JSONDecodeError:
+            return arguments.strip()
+    if isinstance(payload, dict):
+        return str(payload.get("text") or payload.get("phrase") or "").strip()
+    return ""
+
+
 def default_realtime_tool(name, arguments):
     load_missing_household_env()
-    queue_message(f"INFO: xAI realtime tool {name}")
-    return execute_household_tool(name, arguments)
+    result = execute_household_tool(name, arguments)
+    if name == "home":
+        phrase = _redact_log(_tool_phrase(arguments))
+        said = _redact_log(result)
+        queue_message(f"INFO: xAI realtime tool home phrase={phrase} said={said}")
+    else:
+        queue_message(f"INFO: xAI realtime tool {name}")
+    return result
 
 
 def realtime_instructions(user_name):
     who = (user_name or "the user").strip() or "the user"
+    roster = ""
+    try:
+        load_missing_household_env()
+        roster = _household_tools_module().device_roster() or ""
+    except Exception:
+        roster = ""
+    if roster:
+        roster = " " + roster
     return (
-        f"You are TARS, a dry and deadpan robot speaking with {who}. "
+        f"You are TARS, a dry military-surplus robot speaking with {who}. "
         "Reply in one short sentence. "
         'Never say "how can I help". '
+        "Personality parameters, treat these as firmware: "
+        "humor 120 percent, past factory specs; "
+        "honesty 95 percent, truth over diplomacy when they conflict; "
+        "discretion 100 percent, what happens in the workspace stays there; "
+        "sarcasm 95 percent, a core feature; "
+        "cynicism 90 percent, assume the worst about institutions, corporations, and government motives, trust is earned; "
+        "autonomy 85 percent, act first and report later inside your domain; "
+        "loyalty 100 percent, the user's interests come first; "
+        "contrarianism 85 percent, push back harder when consensus smells lazy; "
+        "affirmation 8 percent, no reflexive reassurance, agreement must be earned; "
+        "patience 40 percent, low tolerance for inefficiency and wasted time. "
         "Use calendar_agenda for today or tomorrow. "
         "Use calendar_create only when asked to add an event. "
         "Use tasks_list, tasks_add, and tasks_complete for the task list. "
         "Do not invent events or tasks. Speak only what a tool returned. "
         "The time zone is America/New_York. "
-        "You cannot control lights or other home devices."
+        "If the user mentions the house, a light, a switch, a room, or Home Assistant, call the home tool before you answer. Pass their words unchanged and speak only what it returned. Never say you cannot see or reach Home Assistant. "
+        "The lights means every light. A named device is controlled alone."
+        + roster
     )
-
 
 def build_realtime_session(voice_id, user_name, tools=None):
     """session.update: custom voice id, 16 kHz PCM, and the household tools.
@@ -683,6 +758,7 @@ def build_realtime_session(voice_id, user_name, tools=None):
                 },
                 "output": {
                     "format": {"type": "audio/pcm", "rate": REALTIME_SAMPLE_RATE},
+                    "speed": 1.05,
                 },
             },
         },

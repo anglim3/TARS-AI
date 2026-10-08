@@ -171,7 +171,7 @@ class STTManager:
             queue_message(f"INFO: Mic native rate {self.DEVICE_SAMPLE_RATE} Hz — will resample to {self.MODEL_RATE} Hz")
 
         self.amp_gain = CONFIG['STT'].get('mic_amp_gain', 10.0)
-        self.silence_margin = CONFIG['STT'].get('silence_margin', 3.0)
+        self.silence_margin = CONFIG['STT'].get('silence_margin', 2.0)
         self.wake_silence_threshold = None
         self.silence_threshold = None  # Updated after measuring background noise
         self.silence_threshold_margin = None
@@ -1412,6 +1412,13 @@ class STTManager:
             print()
             STTManager._last_status_was_sleeping = True
             set_tars_state(TarsState.STANDBY)
+            # 2 minute panel blank starts when we return to wake-word sleep,
+            # after the reply. A later retry of the detector must not reset it.
+            try:
+                from modules.module_display_power import note_sleep
+                note_sleep()
+            except Exception:
+                pass
 
         processors = {
             "fastrtc": self._detect_wake_word_fastrtc,
@@ -1422,6 +1429,13 @@ class STTManager:
 
     def _handle_wake_detected(self):
         """Common actions after wake word is detected: beep, notify UI, send response."""
+        # Before the acknowledgment. If the panel is already on, this only
+        # holds it on and the idle clock restarts on the next return to sleep.
+        try:
+            from modules.module_display_power import note_wake
+            note_wake()
+        except Exception:
+            pass
         if self.config["STT"].get("use_indicators"):
             self.play_wav(os.path.join(_stt_dir(), "beep_on.wav"))
         self._fire_and_forget_get(f"http://127.0.0.1:{self._webui_port}/start_talking")
@@ -1524,8 +1538,15 @@ class STTManager:
         detector = WakeWordSystem(self.WAKE_WORD, self.MODEL_RATE, threshold, debug=self.DEBUG, mode=mode)
         detector.createModel()
         # Wait for TTS to finish before entering blocking wake word listener
-        while is_tts_playing():
+        waited = 0.0
+        while is_tts_playing() and waited < 3.0:
             time.sleep(0.05)
+            waited += 0.05
+        if is_tts_playing():
+            from modules.module_tts import _tts_playing
+            from modules.module_messageQue import queue_message
+            _tts_playing.clear()
+            queue_message("INFO: cleared a stuck playback flag so the mic can listen")
         while True:
             detector.listenForWakeWord()
             audio_window = np.array(list(detector.buffer)[-int(self.MODEL_RATE * 2):], dtype=np.float32)
@@ -1647,7 +1668,9 @@ class STTManager:
 
     @staticmethod
     def _fire_and_forget_get(url):
-        threading.Thread(target=lambda: requests.get(url, timeout=1), daemon=True).start()
+        """Notify the face UI. A closed port must not print a traceback."""
+        from modules.module_mic import quiet_get
+        quiet_get(url, requests.get)
 
     # === Progress Bar ===
 
