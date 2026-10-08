@@ -524,6 +524,9 @@ class RealtimeTurnTests(unittest.TestCase):
         self.assertIn("tasks_add", names)
         self.assertIn("tasks_complete", names)
         self.assertIn("home", names)
+        self.assertIn("ha_call_service", names)
+        self.assertIn("weather", names)
+        self.assertIn("set_personality", names)
         sent_types = [
             json.loads(item).get("type")
             for item in socket.sent
@@ -628,6 +631,10 @@ class RealtimeTurnTests(unittest.TestCase):
         for name in ("HA_TOKEN", "HA_URL"):
             os.environ.pop(name, None)
         self.assertIn("home", xai.REALTIME_TOOL_NAMES)
+        self.assertIn("ha_call_service", xai.REALTIME_TOOL_NAMES)
+        # The old home tool stays callable, and the prompt treats it as the fallback.
+        text = xai.realtime_instructions("Ada")
+        self.assertIn("last-resort", text)
         self.assertEqual(
             xai.execute_household_tool("home", {"text": "turn off the lights"}),
             "Home Assistant is not configured.",
@@ -658,6 +665,8 @@ class RealtimeTurnTests(unittest.TestCase):
         self.assertIn("A named device is controlled alone", text)
         self.assertNotIn("Dimmer", text)
         self.assertNotIn("Outlet", text)
+        self.assertIn("lamp", text.lower())
+        self.assertIn("Today is", text)
 
     def test_home_tool_logs_the_phrase_and_the_sentence(self):
         os.environ["HA_TOKEN"] = "super-secret-token"
@@ -771,6 +780,56 @@ class WakeGateTests(unittest.TestCase):
         self.assertEqual(seen, ["http://127.0.0.1:80/start_talking"])
         self.assertEqual(errors, [])
         self.assertFalse(thread.is_alive())
+
+    def test_panel_blanks_only_overnight(self):
+        import time
+        import modules.module_display_power as power
+
+        def at(hour, minute=0):
+            return time.struct_time((2026, 10, 8, hour, minute, 0, 3, 281, -1))
+
+        self.assertTrue(power.panel_should_blank(at(20)))
+        self.assertTrue(power.panel_should_blank(at(0)))
+        self.assertTrue(power.panel_should_blank(at(7, 59)))
+        self.assertFalse(power.panel_should_blank(at(8)))
+        self.assertFalse(power.panel_should_blank(at(19, 59)))
+
+    def test_voice_speed_is_clamped(self):
+        path = os.path.join(SRC, "config.ini")
+        previous = open(path, "rb").read() if os.path.exists(path) else None
+        try:
+            for raw, expected in (("9", 1.5), ("0.1", 0.7), ("1.10", 1.10)):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(f"[TTS]\nvoice_speed = {raw}\n")
+                self.assertAlmostEqual(xai.realtime_voice_speed(), expected)
+        finally:
+            if previous is None:
+                if os.path.exists(path):
+                    os.remove(path)
+            else:
+                with open(path, "wb") as handle:
+                    handle.write(previous)
+
+    def test_voice_session_expires_after_ttl(self):
+        import time
+        import modules.module_voice_session as session
+
+        session.clear()
+        session.configure(30)
+        session.add_turn("hello", "hi")
+        _age, turns = session.snapshot()
+        self.assertEqual(len(turns), 2)
+        session._last_ts = time.time() - 120
+        _age, turns = session.snapshot()
+        self.assertEqual(turns, [])
+        session.clear()
+
+    def test_debug_turn_audio_stays_off_by_default(self):
+        import glob
+        before = set(glob.glob("/tmp/tars-turn-*.wav"))
+        xai._maybe_save_turn_wav([b"\x00\x00" * 8])
+        after = set(glob.glob("/tmp/tars-turn-*.wav"))
+        self.assertEqual(before, after)
 
 
 if __name__ == "__main__":

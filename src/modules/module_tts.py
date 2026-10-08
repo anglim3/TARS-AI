@@ -556,6 +556,13 @@ async def play_audio_chunks(text, config, is_wakeword=False, emotion=None):
                         ])
                     samplerate = 16000
 
+                # Movie-TARS room/voice effect ([TTS] voice_fx).
+                try:
+                    from modules.module_voice_fx import process_float
+                    data = process_float(data, samplerate)
+                except Exception:
+                    pass
+
                 # Decoded samples only. Peak-normalize plus a 1.5 gain made
                 # the wake acknowledgment louder than the realtime reply,
                 # which aplay sends with no software scale.

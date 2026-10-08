@@ -240,7 +240,13 @@ class UIManagerLite(threading.Thread):
                     ss_mgr.reset_timer()
 
                 if ss_mgr:
-                    ss_mgr.check_timeout()
+                    from modules.module_display_power import panel_should_blank
+                    if panel_should_blank():
+                        if ss_mgr.is_active():
+                            ss_mgr.deactivate()
+                        ss_mgr.reset_timer()
+                    else:
+                        ss_mgr.check_timeout()
 
                 with self._lock:
                     new = self._pending[:]

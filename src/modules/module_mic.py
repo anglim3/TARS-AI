@@ -731,6 +731,12 @@ def _aplay_pcm(pcm, device, sample_rate):
     from modules.module_messageQue import queue_message
 
     try:
+        from modules.module_voice_fx import process_pcm
+        pcm = process_pcm(pcm, sample_rate)
+    except Exception as exc:
+        queue_message(f"WARN: voice fx skipped: {type(exc).__name__}: {exc}")
+
+    try:
         completed = subprocess.run(
             [
                 "aplay",

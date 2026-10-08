@@ -9,9 +9,13 @@ from .tools import (
     calendar_add,
     calendar_agenda,
     home,
+    ha_call_service,
+    ha_services,
+    ha_states,
     tasks_add,
     tasks_complete,
     tasks_list,
+    weather,
 )
 
 _HANDLERS = {
@@ -21,11 +25,15 @@ _HANDLERS = {
     "tasks_list": tasks_list,
     "tasks_add": tasks_add,
     "tasks_complete": tasks_complete,
+    "ha_states": ha_states,
+    "ha_call_service": ha_call_service,
+    "ha_services": ha_services,
+    "weather": weather,
 }
 
 
 def register(ctx):
-    """Register the six household tools. Hermes calls this once at startup."""
+    """Register the household tools. Hermes calls this once at startup."""
     for schema in TOOLS:
         name = schema["name"]
         ctx.register_tool(

@@ -68,7 +68,7 @@ class HouseholdTests(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self._saved)
 
-    def test_register_lists_the_six_tools(self):
+    def test_register_lists_household_tools(self):
         ctx = Ctx()
         household.register(ctx)
         names = [item[0] for item in ctx.tools]
@@ -79,6 +79,10 @@ class HouseholdTests(unittest.TestCase):
             "tasks_list",
             "tasks_add",
             "tasks_complete",
+            "ha_states",
+            "ha_call_service",
+            "ha_services",
+            "weather",
         ])
         self.assertTrue(all(item[1] == "household" for item in ctx.tools))
 
@@ -185,6 +189,46 @@ class HouseholdTests(unittest.TestCase):
         self.assertIn("More than one match", said)
         self.assertEqual(len(http.calls), 1)
         self.assertEqual(http.calls[0][0], "GET")
+
+    def test_voice_cannot_unlock_or_disarm(self):
+        locked = tools.ha_call_service({
+            "domain": "lock",
+            "service": "unlock",
+            "entity_ids": ["lock.front_door"],
+        })
+        disarmed = tools.ha_call_service({
+            "domain": "alarm_control_panel",
+            "service": "alarm_disarm",
+            "entity_ids": ["alarm_control_panel.home"],
+        })
+        unnamed = tools.ha_call_service({"domain": "lock", "service": "lock"})
+        self.assertIn("not allowed", locked)
+        self.assertIn("not allowed", disarmed)
+        self.assertIn("explicitly named", unnamed)
+
+    def test_weather_without_a_location_does_not_guess(self):
+        http = RecordingHttp([])
+        said = tools.weather({"when": "today"}, http=http)
+        self.assertEqual(said, "Home location is not available from Home Assistant.")
+        self.assertEqual(http.calls, [])
+
+    def test_calendar_agenda_accepts_a_date_range(self):
+        os.environ["GOOGLE_OAUTH_CLIENT_ID"] = "id"
+        os.environ["GOOGLE_OAUTH_CLIENT_SECRET"] = "secret"
+        os.environ["GOOGLE_OAUTH_REFRESH_TOKEN"] = "refresh"
+        os.environ["CALENDAR_TIMEZONE"] = "UTC"
+        http = RecordingHttp([
+            Response({"access_token": "ya29.test"}),
+            Response({"items": []}),
+        ])
+        said = tools.calendar_agenda({"start": "2026-10-10", "end": "2026-10-11"}, http=http)
+        self.assertIn("2026-10-10", said)
+        self.assertIn("2026-10-11", said)
+        self.assertIn("nothing scheduled", said)
+        self.assertEqual(http.calls[0][0], "POST")
+        params = http.calls[1][2]["params"]
+        self.assertTrue(params["timeMin"].startswith("2026-10-10"))
+        self.assertTrue(params["timeMax"].startswith("2026-10-11"))
 
     def test_not_an_amelia_skill_path(self):
         skill_dir = os.path.join(ROOT, "src", "skills")
