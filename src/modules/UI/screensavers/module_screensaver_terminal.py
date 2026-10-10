@@ -18,7 +18,9 @@ This license applies only to this file and does not override licenses of other f
 """
 import pygame
 import random
+import time
 from UI.screensavers.module_screensaver_overlay import TimeOverlay
+from UI.module_ui_film import FilmScreen, format_clock, read_personality
 
 class TerminalAnimation:
     def __init__(self, screen, width, height, show_time=False):
@@ -270,42 +272,58 @@ class TerminalAnimation:
         return segments
 
     def render(self):
-        self.screen.fill((0, 0, 0))
-        
-        start_y = self.height - (self.max_lines * self.line_height)
-        
-        for i, line in enumerate(self.lines):
-            y = start_y + (i * self.line_height)
-            text = line['text']
-            alpha = line['alpha']
-            
-            if not text:
-                continue
-            
-            should_blink = False
+        film = getattr(self, "_film", None)
+        if film is None or film.width != self.width or film.height != self.height:
+            film = FilmScreen(self.width, self.height)
+            self._film = film
+        cols = film.columns()
+        lines = [("hi", "TARS//04"), ("rule", "")]
+        visible = [line for line in self.lines if line.get("text")]
+        start = max(0, len(visible) - 28)
+        window = visible[start:]
+        last = len(window) - 1
+        for index, line in enumerate(window):
+            text = line["text"]
+            stripped = text.lstrip()
+            blink = False
             for keyword in self.blinking_keywords:
                 if keyword in text:
-                    should_blink = True
+                    blink = True
                     break
-            
-            if should_blink and (self.blink_counter // 10) % 2 == 0:
-                alpha = min(255, alpha + 55)
-            
-            segments = self._parse_syntax(text, alpha)
-            x_offset = 20
-            
-            for segment_text, color, seg_alpha, use_bold in segments:
-                text_color = (
-                    int(color[0] * (seg_alpha / 255)),
-                    int(color[1] * (seg_alpha / 255)),
-                    int(color[2] * (seg_alpha / 255))
-                )
-                
-                font_to_use = self.font_bold if use_bold else self.font
-                text_surface = font_to_use.render(segment_text, True, text_color)
-                self.screen.blit(text_surface, (x_offset, y))
-                x_offset += text_surface.get_width()
-            
-        
-        if self.show_time and self.time_overlay:
-            self.time_overlay.render(self.screen)
+            if blink and (self.blink_counter // 10) % 2 == 0:
+                kind = "hi"
+            elif index == last:
+                kind = "hi"
+            elif stripped.startswith("#"):
+                kind = "dim"
+            elif text.startswith(" ") or index < last - 8:
+                kind = "in"
+            else:
+                kind = "text"
+            if len(text) > cols:
+                text = text[:cols]
+            lines.append((kind, text))
+        persona = read_personality()
+        humor = int(persona.get("humor", 90))
+        honesty = int(persona.get("honesty", 95))
+        sarcasm = int(persona.get("sarcasm", 95))
+        rows = [
+            ("HONESTY", f"{honesty}%"),
+            ("HUMOR", f"{humor}%"),
+            ("SARCASM", f"{sarcasm}%"),
+            None,
+            ("MODE", "IDLE"),
+            ("STATE", "CODE"),
+        ]
+        if self.show_time:
+            ampm = bool(self.time_overlay.ampm_format) if self.time_overlay else False
+            rows.append(("TIME", format_clock(ampm)))
+        phase = (time.monotonic() % 2.8) / 2.8
+        film.render(
+            self.screen,
+            lines,
+            rows,
+            palette="full",
+            meter={"style": "idle", "label": "RUN"},
+            phase=phase,
+        )

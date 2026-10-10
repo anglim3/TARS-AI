@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import List, Tuple, Callable, Optional
 
 from modules.module_config import load_config
+from UI.module_ui_film import FilmScreen, compose_frame, format_clock, read_personality
 
 CONFIG = load_config()
 
@@ -1151,6 +1152,168 @@ class TerminalSystem:
             surface.blit(text_surface, text_rect)
 
     def draw(self, surface):
+        if self.camera_active or self.app_active:
+            self._draw_legacy(surface)
+            return
+        self._draw_film_view(surface)
+        if self.show_power_menu:
+            self._draw_power_menu(surface)
+        if self.show_main_menu:
+            self._draw_main_menu(surface)
+        if self.show_app_menu:
+            self._draw_app_menu(surface)
+        self._draw_toast(surface)
+
+    def _film_screen(self, surface):
+        size = surface.get_size()
+        film = getattr(self, "_film", None)
+        if film is None or (film.width, film.height) != size:
+            film = FilmScreen(size[0], size[1])
+            self._film = film
+        return film
+
+    def _draw_film_view(self, surface):
+        """Opaque black readout. Replaces the chat pills on the main view."""
+        film = self._film_screen(surface)
+        status = (self.tars_status or "STANDBY").upper()
+        mode = {
+            "BOOTING": "BOOT",
+            "STANDBY": "SLEEP",
+            "LISTENING": "LISTEN",
+            "THINKING": "THINK",
+            "TALKING": "TALK",
+        }.get(status, "SLEEP")
+        if self.thinking and mode not in ("LISTEN", "TALK"):
+            mode = "THINK"
+
+        messages = []
+        if mode in ("LISTEN", "TALK", "THINK"):
+            for key, value, _msg_type, _ts in self.messages[-24:]:
+                if str(key).upper() in ("DEBUG", "DEBUG VOICE"):
+                    continue
+                messages.append((key, value))
+            messages = messages[-5:]
+            if self.scroll_offset > 0 and len(self.messages) > self.scroll_offset:
+                start = max(0, len(self.messages) - 5 - int(self.scroll_offset))
+                end = max(start, len(self.messages) - int(self.scroll_offset))
+                window = []
+                for key, value, _msg_type, _ts in self.messages[start:end]:
+                    if str(key).upper() in ("DEBUG", "DEBUG VOICE"):
+                        continue
+                    window.append((key, value))
+                if window:
+                    messages = window[-5:]
+
+        link = None
+        if self._wifi_initialized:
+            link = str(self._wifi_mode or "").upper() or None
+        battery = None
+        if self.battery_module:
+            try:
+                info = self.battery_module.get_battery_status()
+                if info.get("sensor_initialized"):
+                    battery = f"{int(info.get('normalized_percentage') or 0)}%"
+            except Exception:
+                battery = None
+        thermal = None
+        if self.show_cpu_temp and self.cpu_temp_module and self.current_cpu_temp:
+            thermal = f"{self.current_cpu_temp:.0f}C"
+
+        silence = 0.0
+        level = 0.0
+        if mode == "LISTEN" and self._silence_max:
+            silence = max(0.0, float(self._silence_progress or 0))
+            level = min(1.0, silence / float(self._silence_max))
+        elif mode == "LISTEN":
+            level = 0.0
+
+        wake = "hey tars"
+        ampm = False
+        name = "TARS"
+        try:
+            wake = CONFIG.get("STT", {}).get("wake_word", wake) or wake
+            ampm = bool(CONFIG.get("UI", {}).get("ampm_format", False))
+            name = CONFIG.get("CHAR", {}).get("character_name", name) or name
+        except Exception:
+            pass
+
+        frame = compose_frame(
+            mode,
+            columns=film.columns(),
+            name=name,
+            wake=str(wake),
+            messages=messages,
+            personality=read_personality(),
+            time_text=format_clock(ampm),
+            silence=silence,
+            link=link,
+            battery=battery,
+            thermal=thermal,
+        )
+        phase = (time.monotonic() % 1.6) / 1.6
+        film.render(
+            surface,
+            frame["lines"],
+            frame["rows"],
+            palette=frame["palette"],
+            meter=frame["meter"],
+            phase=phase,
+            level=level,
+            reserve_bottom=16,
+        )
+        self._draw_film_chrome(surface, film)
+
+    def _draw_film_chrome(self, surface, film):
+        """Keep power and scroll targets, drawn as dim text so they stay usable."""
+        color = (28, 96, 98)
+        plates = getattr(self, "_film_chrome", None)
+        if plates is None:
+            from UI.module_ui_film import mono_font
+            chrome = mono_font(max(11, film.left_px - 2))
+            plates = (
+                chrome.render("^", True, color),
+                chrome.render("v", True, color),
+                chrome.render("PWR", True, color),
+            )
+            self._film_chrome = plates
+        up, down, pwr = plates
+        x = film.left.x
+        y = surface.get_height() - up.get_height() - 2
+        self.scroll_up_rect = pygame.Rect(x, y, up.get_width() + 8, up.get_height() + 4)
+        self.scroll_down_rect = pygame.Rect(
+            x + up.get_width() + 14, y, down.get_width() + 8, down.get_height() + 4
+        )
+        surface.blit(up, (x, y))
+        surface.blit(down, (self.scroll_down_rect.x, y))
+        pwr_x = surface.get_width() - pwr.get_width() - 4
+        for button in self.top_buttons:
+            if button.get("label") == "PWR-DN":
+                button["rect"] = pygame.Rect(pwr_x - 4, y - 2, pwr.get_width() + 8, pwr.get_height() + 4)
+        surface.blit(pwr, (pwr_x, y))
+
+    def _draw_toast(self, surface):
+        if not self._toast_text:
+            return
+        elapsed = time.time() - self._toast_time
+        if elapsed < self._toast_duration:
+            if elapsed > self._toast_duration - 0.5:
+                alpha = int(255 * (self._toast_duration - elapsed) / 0.5)
+            else:
+                alpha = 255
+            toast_surface = self._status_font.render(self._toast_text, True, self.primary_color)
+            toast_surface.set_alpha(alpha)
+            if self.main_menu_rect:
+                toast_rect = toast_surface.get_rect(
+                    centerx=self.main_menu_rect.centerx,
+                    bottom=self.main_menu_rect.top - 10,
+                )
+            else:
+                toast_rect = toast_surface.get_rect(centerx=self.width // 2, top=12)
+            surface.blit(toast_surface, toast_rect)
+        else:
+            self._toast_text = None
+
+    def _draw_legacy(self, surface):
         self._update_wrapped_cache()
 
         self.overlay_surface.fill((0, 0, 0, 0))
@@ -1481,23 +1644,7 @@ class TerminalSystem:
         if self.show_main_menu:
             self._draw_main_menu(surface)
 
-        if self._toast_text:
-            elapsed = time.time() - self._toast_time
-            if elapsed < self._toast_duration:
-                if elapsed > self._toast_duration - 0.5:
-                    alpha = int(255 * (self._toast_duration - elapsed) / 0.5)
-                else:
-                    alpha = 255
-                toast_surface = self._status_font.render(self._toast_text, True, self.primary_color)
-                toast_surface.set_alpha(alpha)
-                if self.main_menu_rect:
-                    toast_rect = toast_surface.get_rect(centerx=self.main_menu_rect.centerx,
-                                                        bottom=self.main_menu_rect.top - 10)
-                else:
-                    toast_rect = toast_surface.get_rect(centerx=self.width // 2, top=12)
-                surface.blit(toast_surface, toast_rect)
-            else:
-                self._toast_text = None
+        self._draw_toast(surface)
 
         if self.show_app_menu:
             self._draw_app_menu(surface)

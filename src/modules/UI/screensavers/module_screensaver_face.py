@@ -19,7 +19,15 @@ This license applies only to this file and does not override licenses of other f
 import pygame
 import math
 import random
+import time
 from UI.screensavers.module_screensaver_overlay import TimeOverlay
+from UI.module_ui_film import (
+    FilmScreen,
+    compose_frame,
+    format_clock,
+    pair,
+    read_personality,
+)
 
 class FaceAnimation:
     def __init__(self, screen, width, height, show_time=False):
@@ -253,41 +261,77 @@ class FaceAnimation:
                     drop['retracting'] = True
 
     def render(self):
-        self.screen.fill((0, 0, 0))
-        center_x = self.width // 2
-        center_y = self.height // 2 - 125
-        head_offset = int(self.head_turn_offset)
+        """Same sleep cycle as before, drawn as a dim cyan readout."""
         self.animation_time += 0.02
-        breathe = 1 + 0.02 * math.sin(self.animation_time)
-        eye_y_base = center_y - 10
-        eye_spacing = 45
-        eye_base_width = 50
-        eye_base_height = 60
-        eye_color = (0, 255, 220)
-        left_eye_height = int(eye_base_height * (0.15 + 0.85 * self.left_eye_open) * self.left_eye_current_scale)
-        left_eye_width = int(eye_base_width * breathe * self.left_eye_current_scale)
-        right_eye_height = int(eye_base_height * (0.15 + 0.85 * self.right_eye_open) * self.right_eye_current_scale)
-        right_eye_width = int(eye_base_width * breathe * self.right_eye_current_scale)
-        left_closed_height = int(eye_base_height * 0.15 * self.left_eye_current_scale)
-        right_closed_height = int(eye_base_height * 0.15 * self.right_eye_current_scale)
-        left_bottom_edge = eye_y_base + left_closed_height // 2
-        right_bottom_edge = eye_y_base + right_closed_height // 2
-        left_eye_y = left_bottom_edge - left_eye_height // 2
-        right_eye_y = right_bottom_edge - right_eye_height // 2
-        left_eye_x = center_x - eye_spacing + int(self.eye_offset_x) + head_offset
-        self._draw_rounded_rect_eye(left_eye_x, left_eye_y, left_eye_width, left_eye_height, eye_color, self.left_eye_open)
-        right_eye_x = center_x + eye_spacing + int(self.eye_offset_x) + head_offset
-        self._draw_rounded_rect_eye(right_eye_x, right_eye_y, right_eye_width, right_eye_height, eye_color, self.right_eye_open)
-        mouth_y = center_y + 35 + int(self.mouth_offset_y)
-        mouth_color = (100, 100, 120)
-        pygame.draw.line(self.screen, mouth_color, (center_x - 20 + head_offset, mouth_y), (center_x + 20 + head_offset, mouth_y), 3)
+        film = getattr(self, "_film", None)
+        if film is None or film.width != self.width or film.height != self.height:
+            film = FilmScreen(self.width, self.height)
+            self._film = film
+        cols = film.columns()
+        if self.left_eye_open > 0.2 and self.right_eye_open > 0.2:
+            optics = "OPEN"
+        elif self.left_eye_open > 0.2:
+            optics = "L-OPEN"
+        elif self.right_eye_open > 0.2:
+            optics = "R-OPEN"
+        else:
+            optics = "CLOSED"
+        if self.look_direction < 0:
+            gaze = "LEFT"
+        elif self.look_direction > 0:
+            gaze = "RIGHT"
+        else:
+            gaze = "CENTER"
+        state = {
+            "sleeping": "SLEEP",
+            "waking": "WAKE",
+            "one_eye_open": "HALF",
+            "looking_around": "LOOK",
+            "back_to_sleep": "SLEEP",
+        }.get(self.sleep_state, "SLEEP")
+        awake = optics != "CLOSED" or self.sleep_state == "looking_around"
+        ampm = bool(self.time_overlay.ampm_format) if self.time_overlay else False
+        frame = compose_frame(
+            "SLEEP",
+            columns=cols,
+            personality=read_personality(),
+            time_text=format_clock(ampm) if self.show_time else "--:--:--",
+        )
+        extras = [
+            ("in", "  " + pair("gaze", gaze, cols - 2)),
+            ("in", "  " + pair("cycle", state, cols - 2)),
+        ]
+        lines = []
+        inserted = False
+        for item in frame["lines"]:
+            text = item[1] if isinstance(item, tuple) else ""
+            if not inserted and text.startswith("  loop"):
+                lines.extend(extras)
+                inserted = True
+            if text.startswith("OPTICS"):
+                lines.append(("hi" if optics != "CLOSED" else "text", pair("OPTICS", optics, cols)))
+            else:
+                lines.append(item)
+        if not inserted:
+            lines.extend(extras)
         if self.drool_drops:
-            self._draw_drool(center_y, head_offset)
-        if self.sleep_state in ["sleeping", "waking", "one_eye_open", "back_to_sleep"]:
-            self._draw_sleeping_z(center_x, center_y, head_offset)
-        
-        if self.show_time and self.time_overlay:
-            self.time_overlay.render(self.screen)
+            lines.append(("dim", pair("SEAL", "WET", cols)))
+        rows = []
+        for row in frame["rows"]:
+            if row and row[0] == "STATE":
+                rows.append(("STATE", state))
+            else:
+                rows.append(row)
+        phase = (time.monotonic() % 2.4) / 2.4
+        film.render(
+            self.screen,
+            lines,
+            rows,
+            palette="full" if awake else "dim",
+            meter={"style": "listen" if awake else "sleep", "label": "OPTIC"},
+            phase=phase,
+            level=max(self.left_eye_open, self.right_eye_open),
+        )
 
     def _draw_rounded_rect_eye(self, center_x, center_y, width, height, color, open_amount):
         x = center_x - width // 2

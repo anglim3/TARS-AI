@@ -877,7 +877,27 @@ class UIManager(threading.Thread):
                     
                     clock.tick(self.target_fps)
                     continue
-                
+
+                # The main view is an opaque black readout, so the particle,
+                # starfield, and spectrum passes would be painted over. Skip
+                # them and keep this frame to a fill plus cached text blits.
+                if not self.show_camera:
+                    if self.terminal_system:
+                        self.terminal_system.update()
+                        self.terminal_system.draw(original_surface)
+                    else:
+                        original_surface.fill((0, 0, 0))
+
+                    if self.effective_rotate != 0:
+                        rotated_surface = pygame.transform.rotate(original_surface, self.effective_rotate)
+                        self._render_surface_to_opengl(rotated_surface, texture_id)
+                    else:
+                        self._render_surface_to_opengl(original_surface, texture_id)
+
+                    pygame.display.flip()
+                    clock.tick(self.target_fps)
+                    continue
+
                 glViewport(0, 0, display_width, display_height)
                 
                 glMatrixMode(GL_PROJECTION)
